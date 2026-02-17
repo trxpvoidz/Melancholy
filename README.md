@@ -2,7 +2,7 @@
 
 Welcome to 🖤Melancholy – a multipurpose tool that makes importing/merging/porting packs easier than ever!
 
-Download here: https://www.mediafire.com/file/5l4lotrbc6dq3lu/Melancholy+1.1.zip/file
+Download here: https://www.mediafire.com/file/573wsralmsglzwv/Melancholy+1.1.1.zip/file
 
 ## What can it do?
 
