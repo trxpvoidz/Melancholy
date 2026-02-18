@@ -2037,7 +2037,7 @@ def copy_pack_first(folder):
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    myappid = 'ecliptix.melancholy.1.1.2'
+    myappid = 'ecliptix.melancholy.1.1.1'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
@@ -2048,3 +2048,4 @@ if __name__ == "__main__":
     win = App(splash)
     QTimer.singleShot(2500, win.show)
     sys.exit(app.exec())
+
