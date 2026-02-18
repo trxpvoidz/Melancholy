@@ -2,7 +2,7 @@
 
 Welcome to 🖤Melancholy – a multipurpose tool that makes importing/merging/porting packs easier than ever!
 
-Download here: https://www.mediafire.com/file/573wsralmsglzwv/Melancholy+1.1.1.zip/file
+Download here: https://www.mediafire.com/file/573wsralmsglzwv/Melancholy_1.1.1.zip/file
 
 ## What can it do?
 
@@ -20,6 +20,7 @@ Download here: https://www.mediafire.com/file/573wsralmsglzwv/Melancholy+1.1.1.z
 - 🎵 Custom startup sound (if you want)
 - 🖼️ See skin previews before installing
 - 🎨 Clean design that's easy on the eyes
+- 🔊 Hover and clicking noise on the button
 
 ## How stuff actually works (the simple version)
 
@@ -50,10 +51,10 @@ That's it. No installation, no setup, no headaches.
 
 ## Screenshots
 
-![Store Tab](screenshots/image_2026-02-15_020702892.png)
+![Store Tab](screenshots/image_2026-02-18_165137756.png)
 *The community store - browse and download packs*
 
-![Installed Tab](screenshots/image_2026-02-15_020729971.png)
+![Installed Tab](screenshots/image_2026-02-18_165339446.png)
 *The installed tab is where it shows all the packs installed in the folder*
 
 ![Porter Tab](screenshots/image_2026-02-15_020744936.png)
