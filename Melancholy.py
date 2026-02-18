@@ -2,9 +2,6 @@
 Melancholy Skin Pack Manager
 Copyright (c) 2026 TrxpVoidz (Ecliptix)
 All rights reserved.
-
-This software is proprietary and confidential.
-Unauthorized copying, distribution, or modification is prohibited.
 """
 
 import sys, os, json, zipfile, shutil, tempfile, ctypes, time, shlex
@@ -29,8 +26,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QIcon, QDesktopServices, QPainter, QColor, QBrush, QLinearGradient, QPalette, QFont, QTextCursor
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QPoint, QByteArray
 from PySide6.QtMultimedia import QSoundEffect
-from PySide6.QtGui import QPixmap, QIcon, QDesktopServices, QPainter, QColor, QBrush, QLinearGradient, QPalette, QFont, QTextCursor
-from PySide6.QtCore import Qt, QThread, Signal, QUrl, QPropertyAnimation, QEasingCurve, QTimer, QPoint, QByteArray
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -50,11 +45,27 @@ except ImportError:
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+# ---------------- CUSTOM SOUND BUTTON ----------------
+class SoundButton(QPushButton):
+    def __init__(self, text, hover_sound, click_sound, parent=None):
+        super().__init__(text, parent)
+        self.hover_sound = hover_sound
+        self.click_sound = click_sound
+
+    def enterEvent(self, event):
+        if self.hover_sound and self.hover_sound.isLoaded():
+            self.hover_sound.play()
+        super().enterEvent(event)
+
+    def mousePressEvent(self, event):
+        if self.click_sound and self.click_sound.isLoaded():
+            self.click_sound.play()
+        super().mousePressEvent(event)
 
 # ---------------- PATHS ----------------
 SKIN_PACK_DIR = Path(os.getenv("APPDATA")) / "Minecraft Bedrock" / "premium_cache" / "skin_packs"
@@ -62,6 +73,7 @@ SKIN_PACK_DIR.mkdir(parents=True, exist_ok=True)
 LEGACY_VAULT_DIR = SKIN_PACK_DIR.parent / "legacy_vault"
 LEGACY_VAULT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = SKIN_PACK_DIR / ".skinpack_manager_state.json"
+SETTINGS_FILE = SKIN_PACK_DIR / "settings.json"
 LEGACY_STATE_FILE = LEGACY_VAULT_DIR / ".legacy_vault_state.json"
 MARKETPLACE_URL = "https://raw.githubusercontent.com/trxpvoidz/Skin-Pack-Store-Importer/main/store.json"
 SOUND_FILE = SKIN_PACK_DIR.parent / "startup_sound.wav"
@@ -106,6 +118,29 @@ def read_manifest(path):
 
 def vtuple(v): return tuple(v or [0,0,0])
 
+# ---------------- LOCALIZATION (Improved) ----------------
+def get_pack_display_name(pack_path: Path) -> str:
+    """
+    Get the display name for a skin pack by parsing the first 'skinpack.' entry
+    found in any .lang file inside the 'texts' folder.
+    - Scans all .lang files in 'texts'.
+    - Finds the first line that starts with 'skinpack.' and contains '='.
+    - Returns the value after '='.
+    - If no such line, returns the folder name.
+    """
+    texts_dir = pack_path / "texts"
+    if texts_dir.exists():
+        for lang_file in texts_dir.glob("*.lang"):
+            try:
+                with open(lang_file, 'r', encoding='utf-8-sig') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('skinpack.') and '=' in line:
+                            return line.split('=', 1)[1].strip()
+            except:
+                continue
+    return pack_path.name
+
 # ---------------- SKIN PACK MERGER UTILITIES ----------------
 def remove_quotes(s: str) -> str:
     return s.replace('"', '').strip()
@@ -126,10 +161,8 @@ def merge_geometry_json(files: list[Path], output_path: Path) -> None:
     if not geo_dicts:
         return
 
-    # Choose the largest file as base
     base = max(geo_dicts, key=lambda d: len(json.dumps(d)))
     merged = base.copy()
-
     for other in geo_dicts:
         if other is base:
             continue
@@ -141,29 +174,23 @@ def merge_geometry_json(files: list[Path], output_path: Path) -> None:
                 for geom in value:
                     if isinstance(geom, dict) and geom.get("name") not in existing_names:
                         merged[key].append(geom)
-
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, ensure_ascii=False)
 
 def process_single_pack(sp_dir: Path, output_dir: Path, tex_start: int, cape_start: int) -> tuple[list, int, int]:
     json_path = sp_dir / "skins.json"
     if not json_path.exists():
-        print(f"  [!] skins.json not found in {sp_dir} – skipping.")
         return [], tex_start, cape_start
-
     data = load_json(json_path)
     new_skins = []
-    cape_map: dict[str, str] = {}
-
+    cape_map = {}
     for skin in data["skins"]:
-        # --- texture ---
         old_tex_path = sp_dir / skin["texture"]
         new_tex_name = f"s{tex_start}.png"
         if old_tex_path.exists():
             shutil.copy(old_tex_path, output_dir / new_tex_name)
         skin["texture"] = new_tex_name
 
-        # --- cape ---
         if "cape" in skin:
             orig_cape_name = skin["cape"]
             if orig_cape_name in cape_map:
@@ -177,48 +204,37 @@ def process_single_pack(sp_dir: Path, output_dir: Path, tex_start: int, cape_sta
                 skin["cape"] = new_cape_name
                 cape_start += 1
 
-        # --- localization name ---
         skin["localization_name"] = f"s{tex_start}"
-
         new_skins.append(skin)
         tex_start += 1
-
     return new_skins, tex_start, cape_start
 
 def merge_multiple_skinpacks(pack_dirs: list[Path], output_dir: Path, log_callback=None) -> None:
-    """Merge multiple skin packs into one"""
     def log(msg):
         if log_callback:
             log_callback(msg)
         else:
             print(msg)
-    
     log(f"\n>>> Merging {len(pack_dirs)} packs into: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-
     tex_counter = 1
     cape_counter = 1
     all_skins = []
     geometry_files = []
     manifest_copied = False
-
-    for i, pack_dir in enumerate(pack_dirs):
+    for pack_dir in pack_dirs:
         log(f"  → {pack_dir}")
         skins, tex_counter, cape_counter = process_single_pack(pack_dir, output_dir, tex_counter, cape_counter)
         all_skins.extend(skins)
-
         geo = pack_dir / "geometry.json"
         if geo.exists():
             geometry_files.append(geo)
-
         if not manifest_copied:
             manifest = pack_dir / "manifest.json"
             if manifest.exists():
                 shutil.copy(manifest, output_dir / "manifest.json")
                 manifest_copied = True
                 log(f"  ✔ Copied manifest.json from: {pack_dir.name}")
-
-    # Save merged skins.json
     merged_json = {
         "serialize_name": "merged_pack",
         "localization_name": "merged_pack",
@@ -226,12 +242,9 @@ def merge_multiple_skinpacks(pack_dirs: list[Path], output_dir: Path, log_callba
     }
     with (output_dir / "skins.json").open("w", encoding="utf-8") as f:
         json.dump(merged_json, f, indent=2, ensure_ascii=False)
-
-    # Merge geometry.json
     if geometry_files:
         merge_geometry_json(geometry_files, output_dir / "geometry.json")
         log("  ✔ geometry.json merged")
-
     log("\n  ✔ Merge completed!")
 
 # ---------------- BACKGROUND WIDGET ----------------
@@ -240,46 +253,32 @@ class BackgroundWidget(QWidget):
         super().__init__(parent)
         self.background_image = None
         self.load_background()
-        
     def load_background(self):
-     """Try to load background.png from various locations"""
-     possible_paths = [
-        Path(resource_path("background.png")),
-        Path(os.getcwd()) / "background.png",
-        Path(os.getcwd()) / "assets" / "background.png",
-    ]
-    
-     for path in possible_paths:
-        if path.exists():
-            self.background_image = QPixmap(str(path))
-            break
-                
+        possible_paths = [
+            Path(resource_path("assets/background.png")),
+            Path(os.getcwd()) / "assets" / "background.png",
+            Path(resource_path("background.png")),
+            Path(os.getcwd()) / "background.png",
+        ]
+        for path in possible_paths:
+            if path.exists():
+                self.background_image = QPixmap(str(path))
+                break
     def paintEvent(self, event):
         painter = QPainter(self)
-        
-        # Draw background image if available
         if self.background_image and not self.background_image.isNull():
-            # Scale image to fit window while keeping aspect ratio
             scaled_bg = self.background_image.scaled(
-                self.size(), 
-                Qt.KeepAspectRatioByExpanding, 
-                Qt.SmoothTransformation
+                self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
             )
-            
-            # Center the image
             x = (self.width() - scaled_bg.width()) // 2
             y = (self.height() - scaled_bg.height()) // 2
             painter.drawPixmap(x, y, scaled_bg)
         else:
-            # Fallback gradient if no background image
             gradient = QLinearGradient(0, 0, self.width(), self.height())
             gradient.setColorAt(0, QColor(20, 20, 20, 220))
             gradient.setColorAt(1, QColor(40, 40, 40, 220))
             painter.fillRect(self.rect(), gradient)
-        
-        # Draw a semi-transparent overlay to make text readable
         painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
-        
         super().paintEvent(event)
 
 # ---------------- MERGER WORKER ----------------
@@ -287,23 +286,17 @@ class MergerWorker(QThread):
     log = Signal(str)
     progress = Signal(int)
     finished = Signal(bool, str)
-    
     def __init__(self, pack_dirs, output_dir):
         super().__init__()
         self.pack_dirs = pack_dirs
         self.output_dir = output_dir
-        
     def run(self):
         try:
-            def log_callback(msg):
-                self.log.emit(msg)
-            
-            # Simulate progress
+            def log_callback(msg): self.log.emit(msg)
             self.progress.emit(10)
             merge_multiple_skinpacks(self.pack_dirs, self.output_dir, log_callback)
             self.progress.emit(100)
             self.finished.emit(True, "Merge completed successfully!")
-            
         except Exception as e:
             self.finished.emit(False, str(e))
 
@@ -325,18 +318,15 @@ class DownloadWorker(QThread):
     log = Signal(str)
     finished = Signal(Path)
     error = Signal(str)
-
     def __init__(self, url):
         super().__init__()
         self.url = url
-
     def run(self):
         try:
             self.log.emit("Starting download…")
             tmp_dir = Path(tempfile.gettempdir()) / "mcbe_skin_downloads"
             tmp_dir.mkdir(exist_ok=True)
             zip_path = tmp_dir / "pack.zip"
-
             r = requests.get(self.url, stream=True, timeout=30)
             r.raise_for_status()
             total = int(r.headers.get("Content-Length",0))
@@ -379,7 +369,6 @@ class AnimatedWidget(QWidget):
         super().__init__(parent)
         self._opacity = 1.0
         self.scale = 1.0
-        
     def fade_in(self):
         self.anim = QPropertyAnimation(self, b"opacity")
         self.anim.setDuration(500)
@@ -387,55 +376,47 @@ class AnimatedWidget(QWidget):
         self.anim.setEndValue(1)
         self.anim.setEasingCurve(QEasingCurve.OutCubic)
         self.anim.start()
-        
     def get_opacity(self):
         return self._opacity
-        
     def set_opacity(self, value):
         self._opacity = value
         self.update()
-        
     opacity = property(get_opacity, set_opacity)
 
 # ---------------- STORE CARD ----------------
 class StoreCard(AnimatedWidget):
-    def __init__(self, pack, state, install_cb, uninstall_cb):
+    def __init__(self, pack, state, install_cb, uninstall_cb, hover_sound, click_sound):
         super().__init__()
         self.pack = pack
         self.install_cb = install_cb
         self.uninstall_cb = uninstall_cb
+        self.hover_sound = hover_sound
+        self.click_sound = click_sound
         self.setFixedWidth(220)
         self.setMinimumHeight(300)
-        
-        # Transparent black background
         self.setAutoFillBackground(True)
         palette = self.palette()
         palette.setColor(QPalette.Window, QColor(20, 20, 20, 200))
         self.setPalette(palette)
-        
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignTop)
         layout.setSpacing(8)
-        
         self.thumb = QLabel("Loading…")
         self.thumb.setFixedSize(200,200)
         self.thumb.setAlignment(Qt.AlignCenter)
         self.thumb.setStyleSheet("background-color: rgba(0,0,0,100); border-radius: 10px; color: white;")
         layout.addWidget(self.thumb)
-        
         self.name_label = QLabel(pack.get("name", "Unnamed Pack"))
         self.name_label.setAlignment(Qt.AlignCenter)
         self.name_label.setWordWrap(True)
         self.name_label.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
         layout.addWidget(self.name_label)
-        
         self.badge = QLabel("")
         self.badge.setAlignment(Qt.AlignCenter)
         self.badge.setStyleSheet("color: #00ff00; font-size: 11px;")
         layout.addWidget(self.badge)
-        
         btns = QHBoxLayout()
-        dl = QPushButton("Download")
+        dl = SoundButton("Download", hover_sound, click_sound)
         dl.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,255,255,50);
@@ -451,9 +432,8 @@ class StoreCard(AnimatedWidget):
         """)
         dl.clicked.connect(lambda: install_cb(pack))
         btns.addWidget(dl)
-        
         if any(info.get("store_name") == pack.get("name") for info in state.get("known", [])):
-            rm = QPushButton("Uninstall")
+            rm = SoundButton("Uninstall", hover_sound, click_sound)
             rm.setStyleSheet("""
                 QPushButton {
                     background-color: rgba(255,0,0,50);
@@ -468,13 +448,10 @@ class StoreCard(AnimatedWidget):
             """)
             rm.clicked.connect(lambda: uninstall_cb(pack))
             btns.addWidget(rm)
-            
         layout.addLayout(btns)
-        
         self.update_badge(state)
         self.load_thumb(pack.get("thumbnail"))
         self.fade_in()
-
     def update_badge(self, state):
         if any(info.get("store_name") == self.pack.get("name") for info in state.get("known", [])):
             self.badge.setText("✔ Installed")
@@ -482,7 +459,6 @@ class StoreCard(AnimatedWidget):
         else:
             self.badge.setText("")
             self.badge.setStyleSheet("")
-
     def load_thumb(self, url):
         if not url:
             return
@@ -503,58 +479,41 @@ class DragDropWidget(AnimatedWidget):
         self.setMinimumHeight(120)
         self.text = text
         self.is_hovered = False
-        
-        # Set size policy correctly
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setSizePolicy(policy)
-        
-        # Transparent background
         self.setAutoFillBackground(True)
         palette = self.palette()
         palette.setColor(QPalette.Window, QColor(30, 30, 30, 180))
         self.setPalette(palette)
-        
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setOpacity(self._opacity)
-        
-        # Fill background
         painter.fillRect(self.rect(), QColor(30, 30, 30, 180))
-        
-        # Draw border
         if self.is_hovered:
             painter.setPen(QColor(255, 255, 255, 200))
         else:
             painter.setPen(QColor(255, 255, 255, 100))
-            
         painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 10, 10)
-        
-        # Draw text
         painter.setPen(QColor(255, 255, 255, 200 if self.is_hovered else 150))
         font = painter.font()
         font.setPointSize(12)
         painter.setFont(font)
         painter.drawText(self.rect(), Qt.AlignCenter, self.text)
-
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             self.is_hovered = True
             self.update()
             event.acceptProposedAction()
-
     def dragLeaveEvent(self, event):
         self.is_hovered = False
         self.update()
-
     def dropEvent(self, event):
         self.is_hovered = False
         self.update()
         urls = event.mimeData().urls()
         if not urls:
             return
-            
         if self.multi_folder and self.folder_mode:
-            # Handle multiple folders
             paths = []
             for url in urls:
                 path = url.toLocalFile()
@@ -563,7 +522,6 @@ class DragDropWidget(AnimatedWidget):
             if paths and self.callback:
                 self.callback(paths)
         else:
-            # Single file/folder mode
             path = urls[0].toLocalFile()
             if self.folder_mode and os.path.isdir(path):
                 if self.callback:
@@ -575,7 +533,6 @@ class DragDropWidget(AnimatedWidget):
                 elif not self.file_types:
                     if self.callback:
                         self.callback(path)
-
     def mousePressEvent(self, event):
         self.anim = QPropertyAnimation(self, b"opacity")
         self.anim.setDuration(200)
@@ -583,13 +540,9 @@ class DragDropWidget(AnimatedWidget):
         self.anim.setKeyValueAt(0.5, 0.5)
         self.anim.setKeyValueAt(1, self._opacity)
         self.anim.start()
-        
         if self.folder_mode and self.multi_folder:
-            # Multiple folder selection
             paths = QFileDialog.getExistingDirectory(self, "Select First Folder")
             if paths:
-                # For multiple folders, you'd need a different approach
-                # This is simplified
                 if self.callback:
                     self.callback([paths])
         elif self.folder_mode:
@@ -611,16 +564,13 @@ class LoadingScreen(QSplashScreen):
     def __init__(self):
         pixmap = QPixmap(600, 400)
         pixmap.fill(Qt.transparent)
-        
         painter = QPainter(pixmap)
-        
-       # Try to load background for loading screen
         bg_paths = [
-        Path(resource_path("background.png")),
-         Path(os.getcwd()) / "background.png",
-     Path(os.getcwd()) / "assets" / "background.png"
-]
-        
+            Path(resource_path("assets/background.png")),
+            Path(os.getcwd()) / "assets" / "background.png",
+            Path(resource_path("background.png")),
+            Path(os.getcwd()) / "background.png",
+        ]
         bg_loaded = False
         for path in bg_paths:
             if path.exists():
@@ -630,56 +580,47 @@ class LoadingScreen(QSplashScreen):
                     painter.drawPixmap(0, 0, scaled_bg)
                     bg_loaded = True
                 break
-        
         if not bg_loaded:
             gradient = QLinearGradient(0, 0, 600, 400)
             gradient.setColorAt(0, QColor(0, 0, 0, 240))
             gradient.setColorAt(1, QColor(50, 50, 50, 240))
             painter.fillRect(pixmap.rect(), gradient)
-        
         painter.fillRect(pixmap.rect(), QColor(0, 0, 0, 100))
-        
         painter.setPen(QColor(255, 255, 255, 200))
         font = painter.font()
         font.setPointSize(24)
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(pixmap.rect(), Qt.AlignCenter, "Melancholy\n\nLoading...")
-        
         painter.setPen(QColor(255, 255, 255, 100))
         font.setPointSize(12)
         painter.setFont(font)
         painter.drawText(pixmap.rect().adjusted(0, 100, 0, 0), Qt.AlignCenter, "Skin Pack Manager")
-        
         painter.end()
-        
         super().__init__(pixmap)
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        
     def show_message(self, message):
         self.showMessage(message, Qt.AlignBottom | Qt.AlignCenter, QColor(255, 255, 255, 200))
 
 # ---------------- MERGER TAB WITH ENCRYPTION ----------------
 class MergerTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent, hover_sound, click_sound):
         super().__init__(parent)
         self.parent = parent
+        self.hover_sound = hover_sound
+        self.click_sound = click_sound
         self.pack_dirs = []
         self.merger_worker = None
         self.merged_pack_path = None
         self.setup_ui()
-        
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
-        
-        # Title
         title = QLabel("SkinPack Merger - Combine & Encrypt Multiple Skin Packs")
         title.setStyleSheet("color: white; font-size: 18px; font-weight: bold; padding: 10px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
-        
-        # Description
         desc = QLabel(
             "Drag and drop multiple SkinPack folders to merge them into one combined pack.\n"
             "Textures will be renamed automatically and geometry files will be merged.\n"
@@ -689,8 +630,6 @@ class MergerTab(QWidget):
         desc.setAlignment(Qt.AlignCenter)
         desc.setWordWrap(True)
         layout.addWidget(desc)
-        
-        # Drag & drop area for multiple folders
         self.drop_area = DragDropWidget(
             "📁 Drag SkinPack Folders Here\n(or click to select folders)",
             folder_mode=True,
@@ -699,12 +638,9 @@ class MergerTab(QWidget):
         )
         self.drop_area.setMinimumHeight(150)
         layout.addWidget(self.drop_area)
-        
-        # Selected packs list
         list_label = QLabel("Selected Packs:")
         list_label.setStyleSheet("color: white; font-size: 14px; font-weight: bold; padding: 5px;")
         layout.addWidget(list_label)
-        
         self.pack_list = QListWidget()
         self.pack_list.setStyleSheet("""
             QListWidget {
@@ -716,13 +652,10 @@ class MergerTab(QWidget):
             }
         """)
         layout.addWidget(self.pack_list)
-        
-        # Manifest selection
         manifest_layout = QHBoxLayout()
         manifest_label = QLabel("Select Manifest for Encryption:")
         manifest_label.setStyleSheet("color: white; font-size: 13px;")
         manifest_layout.addWidget(manifest_label)
-        
         self.manifest_dropdown = QComboBox()
         self.manifest_dropdown.addItems(MANIFEST_OPTIONS.keys())
         self.manifest_dropdown.setStyleSheet("""
@@ -746,17 +679,12 @@ class MergerTab(QWidget):
         manifest_layout.addWidget(self.manifest_dropdown)
         manifest_layout.addStretch()
         layout.addLayout(manifest_layout)
-        
-        # Checkbox for encryption
         self.encrypt_checkbox = QCheckBox("🔐 Encrypt merged pack before importing")
         self.encrypt_checkbox.setStyleSheet("color: white; font-size: 13px; padding: 5px;")
         self.encrypt_checkbox.setChecked(True)
         layout.addWidget(self.encrypt_checkbox)
-        
-        # Control buttons
         btn_layout = QHBoxLayout()
-        
-        self.clear_btn = QPushButton("🗑️ Clear List")
+        self.clear_btn = SoundButton("🗑️ Clear List", self.hover_sound, self.click_sound)
         self.clear_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,0,0,50);
@@ -771,8 +699,7 @@ class MergerTab(QWidget):
         """)
         self.clear_btn.clicked.connect(self.clear_list)
         btn_layout.addWidget(self.clear_btn)
-        
-        self.merge_btn = QPushButton("🔄 Merge Packs")
+        self.merge_btn = SoundButton("🔄 Merge Packs", self.hover_sound, self.click_sound)
         self.merge_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(0,150,255,80);
@@ -788,8 +715,7 @@ class MergerTab(QWidget):
         """)
         self.merge_btn.clicked.connect(self.start_merge)
         btn_layout.addWidget(self.merge_btn)
-        
-        self.import_merged_btn = QPushButton("📦 Import Merged Pack")
+        self.import_merged_btn = SoundButton("📦 Import Merged Pack", self.hover_sound, self.click_sound)
         self.import_merged_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(0,255,0,50);
@@ -806,20 +732,14 @@ class MergerTab(QWidget):
         self.import_merged_btn.clicked.connect(self.import_merged_pack)
         self.import_merged_btn.setEnabled(False)
         btn_layout.addWidget(self.import_merged_btn)
-        
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        
-        # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Log output
         log_label = QLabel("Merge Log:")
         log_label.setStyleSheet("color: white; font-size: 12px; padding: 5px;")
         layout.addWidget(log_label)
-        
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumHeight(150)
@@ -833,9 +753,8 @@ class MergerTab(QWidget):
             }
         """)
         layout.addWidget(self.log_output)
-        
+
     def add_folders(self, paths):
-        """Add folders to the list"""
         for path_str in paths:
             path = Path(path_str)
             if path.is_dir() and self.is_valid_skinpack(path):
@@ -844,393 +763,304 @@ class MergerTab(QWidget):
                     self.pack_dirs.append(path)
             else:
                 QMessageBox.warning(self, "Invalid Pack", f"{path} is not a valid skin pack (missing skins.json)")
-        
         self.update_merge_button()
-        
+
     def is_valid_skinpack(self, path):
-        """Check if folder is a valid skin pack"""
         return (path / "skins.json").exists()
-        
+
     def clear_list(self):
-        """Clear the pack list"""
         self.pack_list.clear()
         self.pack_dirs.clear()
         self.log_output.clear()
         self.import_merged_btn.setEnabled(False)
         self.update_merge_button()
-        
+
     def update_merge_button(self):
-        """Update merge button state based on number of packs"""
         if len(self.pack_dirs) >= 2:
             self.merge_btn.setEnabled(True)
         else:
             self.merge_btn.setEnabled(False)
-            
+
     def start_merge(self):
-        """Start the merge process"""
         if len(self.pack_dirs) < 2:
             QMessageBox.warning(self, "Not Enough Packs", "Please select at least 2 skin packs to merge.")
             return
-            
-        # Create output directory
         output_dir = Path(tempfile.gettempdir()) / "merged_skinpack"
         if output_dir.exists():
             shutil.rmtree(output_dir)
-            
-        # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.log_output.clear()
         self.merge_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
-        
-        # Start worker thread
         self.merger_worker = MergerWorker(self.pack_dirs, output_dir)
         self.merger_worker.log.connect(self.log_output.appendPlainText)
         self.merger_worker.progress.connect(self.progress_bar.setValue)
         self.merger_worker.finished.connect(self.on_merge_finished)
         self.merger_worker.start()
-        
+
     def on_merge_finished(self, success, message):
-        """Handle merge completion"""
         self.progress_bar.setVisible(False)
         self.merge_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
-        
         if success:
             self.log_output.appendPlainText("\n✅ Merge completed successfully!")
             self.import_merged_btn.setEnabled(True)
             self.merged_pack_path = Path(tempfile.gettempdir()) / "merged_skinpack"
         else:
             QMessageBox.critical(self, "Merge Failed", f"Failed to merge packs: {message}")
-            
+
     def encrypt_merged_pack(self, pack_path, manifest_choice):
-     """Encrypt the merged pack using EXACT same method as porter tab"""
-     try:
-        self.log_output.appendPlainText(f"\n🔐 Encrypting pack with manifest: {manifest_choice}...")
-        
-        # Create a temporary copy exactly like porter does
-        temp_copy = copy_pack_first(str(pack_path))
-        self.log_output.appendPlainText("  ✓ Pack copied to temporary location")
-        
-        # Setup manifest exactly like porter does
-        setup_porter(temp_copy, manifest_choice)
-        self.log_output.appendPlainText(f"  ✓ Manifest set: {manifest_choice}")
-        
-        # Make sure global variables are accessible
-        global key, encryptedVariable, inputPathSkinpack
-        
-        # Run porter encryption exactly like porter does
-        # Change to the temp directory to ensure paths work correctly
-        original_dir = os.getcwd()
-        os.chdir(temp_copy)
-        
         try:
-            # Call tool_porter with the temp directory
-            tool_porter(temp_copy)
-        finally:
-            # Change back to original directory
-            os.chdir(original_dir)
-            
-        self.log_output.appendPlainText("  ✓ Encryption completed")
-        
-        # Replace original with encrypted version
-        shutil.rmtree(pack_path)
-        shutil.move(temp_copy, pack_path)
-        
-        self.log_output.appendPlainText("  ✓ Encrypted pack ready")
-        return True
-        
-     except Exception as e:
-        self.log_output.appendPlainText(f"  ✗ Encryption failed: {str(e)}")
-        import traceback
-        self.log_output.appendPlainText(f"  Traceback: {traceback.format_exc()}")
-        
-        # Clean up temp directory if it exists
-        try:
-            if 'temp_copy' in locals() and os.path.exists(temp_copy):
-                shutil.rmtree(temp_copy, ignore_errors=True)
-        except:
-            pass
-        return False
-     
+            self.log_output.appendPlainText(f"\n🔐 Encrypting pack with manifest: {manifest_choice}...")
+            temp_copy = copy_pack_first(str(pack_path))
+            self.log_output.appendPlainText("  ✓ Pack copied to temporary location")
+            setup_porter(temp_copy, manifest_choice)
+            self.log_output.appendPlainText(f"  ✓ Manifest set: {manifest_choice}")
+            global key, encryptedVariable, inputPathSkinpack
+            original_dir = os.getcwd()
+            os.chdir(temp_copy)
+            try:
+                tool_porter(temp_copy)
+            finally:
+                os.chdir(original_dir)
+            self.log_output.appendPlainText("  ✓ Encryption completed")
+            shutil.rmtree(pack_path)
+            shutil.move(temp_copy, pack_path)
+            self.log_output.appendPlainText("  ✓ Encrypted pack ready")
+            return True
+        except Exception as e:
+            self.log_output.appendPlainText(f"  ✗ Encryption failed: {str(e)}")
+            import traceback
+            self.log_output.appendPlainText(f"  Traceback: {traceback.format_exc()}")
+            try:
+                if 'temp_copy' in locals() and os.path.exists(temp_copy):
+                    shutil.rmtree(temp_copy, ignore_errors=True)
+            except:
+                pass
+            return False
 
     def encrypt_merged_pack_direct(self, pack_path, manifest_choice):
-     """Direct encryption method if the porter functions fail"""
-     try:
-        self.log_output.appendPlainText(f"\n🔐 Directly encrypting pack with manifest: {manifest_choice}...")
-        
-        # Import necessary modules locally to ensure they're available
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        import json
-        from hashlib import sha256
-        from base64 import b64encode
-        import os
-        import shutil
-        
-        # Create a temporary copy
-        temp_copy = copy_pack_first(str(pack_path))
-        self.log_output.appendPlainText("  ✓ Pack copied to temporary location")
-        
-        # Write the manifest
-        manifest_json = MANIFEST_OPTIONS[manifest_choice]
-        manifest_path = os.path.join(temp_copy, "manifest.json")
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            f.write(manifest_json)
-        self.log_output.appendPlainText(f"  ✓ Manifest written: {manifest_choice}")
-        
-        # Define encryption constants (same as in porter)
-        FIXED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE'
-        fileSkip = {'manifest.json', 'pack_icon.png'}
-        fileSkipForce = {'contents.json', 'signatures.json'}
-        fileSkipFull = fileSkip | fileSkipForce
-        
-        # Process all files
-        fileJSONContents = {"version": 1, "content": []}
-        
-        for root, dirs, files in os.walk(temp_copy):
-            if os.path.basename(root).lower() == 'texts':
-                continue
-            for file in files:
-                pathFile = os.path.join(root, file)
-                doEncrypt = True
-                doNotAdd = False
-                
-                # Check if file should be skipped
-                for skip_file in fileSkipFull:
-                    if pathFile.endswith(skip_file):
-                        doEncrypt = False
-                        if skip_file in fileSkipForce:
-                            doNotAdd = True
-                        break
-                
-                relativePath = os.path.relpath(pathFile, temp_copy).replace("\\", "/")
-                
-                if doEncrypt and not doNotAdd:
-                    # Encrypt the file
-                    key = FIXED_KEY
-                    cipher = Cipher(
-                        algorithms.AES(key.encode('utf-8')),
-                        modes.CFB8(key[:16].encode('utf-8'))
-                    )
-                    encryptor = cipher.encryptor()
-                    
-                    with open(pathFile, 'rb') as f:
-                        data = f.read()
-                    
-                    encrypted_data = encryptor.update(data) + encryptor.finalize()
-                    
-                    with open(pathFile, 'wb') as f:
-                        f.write(encrypted_data)
-                    
-                    fileJSONContents["content"].append({
-                        'key': key,
-                        'path': relativePath
-                    })
-                elif not doNotAdd:
-                    fileJSONContents["content"].append({'path': relativePath})
-        
-        # Create signatures.json
-        manifest_path = os.path.join(temp_copy, "manifest.json")
-        with open(manifest_path, 'rb') as f:
-            manifest_data = f.read()
-            hashVal = b64encode(sha256(manifest_data).digest()).decode()
-        
-        signatures = [{"hash": hashVal, "path": "manifest.json"}]
-        
-        # Encrypt signatures
-        key = FIXED_KEY
-        cipher = Cipher(
-            algorithms.AES(key.encode('utf-8')),
-            modes.CFB8(key[:16].encode('utf-8'))
-        )
-        encryptor = cipher.encryptor()
-        
-        encrypted_sigs = encryptor.update(
-            json.dumps(signatures, separators=(',', ':')).encode('utf-8')
-        ) + encryptor.finalize()
-        
-        sig_path = os.path.join(temp_copy, 'signatures.json')
-        with open(sig_path, 'wb') as f:
-            f.write(encrypted_sigs)
-        
-        # Add signatures to contents
-        fileJSONContents["content"].append({
-            'key': key,
-            'path': 'signatures.json'
-        })
-        
-        # Create final contents.json
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            manifest_data = json.load(f)
-            jsonUUID = manifest_data['header']['uuid']
-        
-        # Encrypt contents
-        cipher = Cipher(
-            algorithms.AES(key.encode('utf-8')),
-            modes.CFB8(key[:16].encode('utf-8'))
-        )
-        encryptor = cipher.encryptor()
-        
-        encrypted_contents = encryptor.update(
-            json.dumps(fileJSONContents, separators=(',', ':')).encode('utf-8')
-        ) + encryptor.finalize()
-        
-        # Create header
-        headerByte = b'\xfc\xb9\xcf\x9b\x00\x00\x00\x00\x00\x00\x00\x00\x24'
-        empty = bytes(256)
-        headerFinal = empty[:4] + headerByte + jsonUUID.encode('utf-8') + empty[53:] + encrypted_contents
-        
-        contents_path = os.path.join(temp_copy, 'contents.json')
-        with open(contents_path, 'wb') as f:
-            f.write(headerFinal)
-        
-        self.log_output.appendPlainText("  ✓ Direct encryption completed")
-        
-        # Replace original with encrypted version
-        shutil.rmtree(pack_path)
-        shutil.move(temp_copy, pack_path)
-        
-        return True
-        
-     except Exception as e:
-        self.log_output.appendPlainText(f"  ✗ Direct encryption failed: {str(e)}")
-        import traceback
-        self.log_output.appendPlainText(f"  Traceback: {traceback.format_exc()}")
-        
-        # Clean up
         try:
-            if 'temp_copy' in locals() and os.path.exists(temp_copy):
-                shutil.rmtree(temp_copy, ignore_errors=True)
-        except:
-            pass
-        return False
+            self.log_output.appendPlainText(f"\n🔐 Directly encrypting pack with manifest: {manifest_choice}...")
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            import json
+            from hashlib import sha256
+            from base64 import b64encode
+            import os
+            import shutil
+            temp_copy = copy_pack_first(str(pack_path))
+            self.log_output.appendPlainText("  ✓ Pack copied to temporary location")
+            manifest_json = MANIFEST_OPTIONS[manifest_choice]
+            manifest_path = os.path.join(temp_copy, "manifest.json")
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                f.write(manifest_json)
+            self.log_output.appendPlainText(f"  ✓ Manifest written: {manifest_choice}")
+            FIXED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE'
+            fileSkip = {'manifest.json', 'pack_icon.png'}
+            fileSkipForce = {'contents.json', 'signatures.json'}
+            fileSkipFull = fileSkip | fileSkipForce
+            fileJSONContents = {"version": 1, "content": []}
+            for root, dirs, files in os.walk(temp_copy):
+                if os.path.basename(root).lower() == 'texts':
+                    continue
+                for file in files:
+                    pathFile = os.path.join(root, file)
+                    doEncrypt = True
+                    doNotAdd = False
+                    for skip_file in fileSkipFull:
+                        if pathFile.endswith(skip_file):
+                            doEncrypt = False
+                            if skip_file in fileSkipForce:
+                                doNotAdd = True
+                            break
+                    relativePath = os.path.relpath(pathFile, temp_copy).replace("\\", "/")
+                    if doEncrypt and not doNotAdd:
+                        key = FIXED_KEY
+                        cipher = Cipher(
+                            algorithms.AES(key.encode('utf-8')),
+                            modes.CFB8(key[:16].encode('utf-8'))
+                        )
+                        encryptor = cipher.encryptor()
+                        with open(pathFile, 'rb') as f:
+                            data = f.read()
+                        encrypted_data = encryptor.update(data) + encryptor.finalize()
+                        with open(pathFile, 'wb') as f:
+                            f.write(encrypted_data)
+                        fileJSONContents["content"].append({
+                            'key': key,
+                            'path': relativePath
+                        })
+                    elif not doNotAdd:
+                        fileJSONContents["content"].append({'path': relativePath})
+            manifest_path = os.path.join(temp_copy, "manifest.json")
+            with open(manifest_path, 'rb') as f:
+                manifest_data = f.read()
+                hashVal = b64encode(sha256(manifest_data).digest()).decode()
+            signatures = [{"hash": hashVal, "path": "manifest.json"}]
+            key = FIXED_KEY
+            cipher = Cipher(
+                algorithms.AES(key.encode('utf-8')),
+                modes.CFB8(key[:16].encode('utf-8'))
+            )
+            encryptor = cipher.encryptor()
+            encrypted_sigs = encryptor.update(
+                json.dumps(signatures, separators=(',', ':')).encode('utf-8')
+            ) + encryptor.finalize()
+            sig_path = os.path.join(temp_copy, 'signatures.json')
+            with open(sig_path, 'wb') as f:
+                f.write(encrypted_sigs)
+            fileJSONContents["content"].append({
+                'key': key,
+                'path': 'signatures.json'
+            })
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest_data = json.load(f)
+                jsonUUID = manifest_data['header']['uuid']
+            cipher = Cipher(
+                algorithms.AES(key.encode('utf-8')),
+                modes.CFB8(key[:16].encode('utf-8'))
+            )
+            encryptor = cipher.encryptor()
+            encrypted_contents = encryptor.update(
+                json.dumps(fileJSONContents, separators=(',', ':')).encode('utf-8')
+            ) + encryptor.finalize()
+            headerByte = b'\xfc\xb9\xcf\x9b\x00\x00\x00\x00\x00\x00\x00\x00\x24'
+            empty = bytes(256)
+            headerFinal = empty[:4] + headerByte + jsonUUID.encode('utf-8') + empty[53:] + encrypted_contents
+            contents_path = os.path.join(temp_copy, 'contents.json')
+            with open(contents_path, 'wb') as f:
+                f.write(headerFinal)
+            self.log_output.appendPlainText("  ✓ Direct encryption completed")
+            shutil.rmtree(pack_path)
+            shutil.move(temp_copy, pack_path)
+            return True
+        except Exception as e:
+            self.log_output.appendPlainText(f"  ✗ Direct encryption failed: {str(e)}")
+            import traceback
+            self.log_output.appendPlainText(f"  Traceback: {traceback.format_exc()}")
+            try:
+                if 'temp_copy' in locals() and os.path.exists(temp_copy):
+                    shutil.rmtree(temp_copy, ignore_errors=True)
+            except:
+                pass
+            return False
 
-        
     def import_merged_pack(self):
-     """Import the merged pack into Minecraft with encryption - ONLY if successful"""
-     if not hasattr(self, 'merged_pack_path') or not self.merged_pack_path.exists():
-        QMessageBox.warning(self, "No Merged Pack", "Please merge packs first.")
-        return
-        
-     # Check if manifest exists and is valid
-     manifest_path = self.merged_pack_path / "manifest.json"
-     if not manifest_path.exists():
-        QMessageBox.critical(self, "Invalid Pack", "Merged pack has no manifest.json - cannot import.")
-        return
-        
-     try:
-        # Verify manifest is valid JSON
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            manifest_data = json.load(f)
-        
-        # Verify manifest has required fields
-        if "header" not in manifest_data or "uuid" not in manifest_data["header"]:
-            QMessageBox.critical(self, "Invalid Manifest", "Manifest.json is missing required fields (header.uuid).")
+        if not hasattr(self, 'merged_pack_path') or not self.merged_pack_path.exists():
+            QMessageBox.warning(self, "No Merged Pack", "Please merge packs first.")
             return
-            
-        uuid = manifest_data["header"]["uuid"]
-        
-     except json.JSONDecodeError:
-        QMessageBox.Critical(self, "Invalid Manifest", "Manifest.json is not valid JSON.")
-        return
-     except Exception as e:
-        QMessageBox.critical(self, "Invalid Manifest", f"Error reading manifest: {str(e)}")
-        return
-    
-     # Handle encryption if requested
-     encrypt_success = False
-     if self.encrypt_checkbox.isChecked():
-        manifest_choice = self.manifest_dropdown.currentText()
-        
-        reply = QMessageBox.question(
-            self,
-            "Encrypt Pack",
-            f"Encrypt merged pack with manifest: {manifest_choice}?\n\n"
-            "This will replace the current manifest with the selected one.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self.log_output.appendPlainText("\n🔐 Starting encryption process...")
-            
-            # Try the standard encryption first
-            encrypt_success = self.encrypt_merged_pack(self.merged_pack_path, manifest_choice)
-            
-            # If standard encryption fails, try direct encryption
-            if not encrypt_success:
-                self.log_output.appendPlainText("\n⚠️ Standard encryption failed, trying direct method...")
-                encrypt_success = self.encrypt_merged_pack_direct(self.merged_pack_path, manifest_choice)
-            
-            if not encrypt_success:
-                QMessageBox.critical(
-                    self, 
-                    "Encryption Failed", 
-                    "Failed to encrypt the merged pack.\n\n"
-                    "The pack will NOT be imported.\n"
-                    "Please check the log for details."
-                )
+
+        # Locate manifest.json anywhere in the merged pack folder
+        manifest_path = None
+        for root, dirs, files in os.walk(self.merged_pack_path):
+            if "manifest.json" in files:
+                manifest_path = Path(root) / "manifest.json"
+                break
+
+        if not manifest_path:
+            QMessageBox.critical(self, "Invalid Pack", "Merged pack has no manifest.json - cannot import.")
+            return
+
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest_data = json.load(f)
+            if "header" not in manifest_data or "uuid" not in manifest_data["header"]:
+                QMessageBox.critical(self, "Invalid Manifest", "Manifest.json is missing required fields (header.uuid).")
                 return
-                
-            self.log_output.appendPlainText("✅ Encryption completed successfully!")
-        else:
-            self.log_output.appendPlainText("\n⏭️ Skipping encryption")
-     else:
-        self.log_output.appendPlainText("\n⏭️ Encryption not requested")
-    
-     # Now proceed with import
-     try:
-        dest_folder = SKIN_PACK_DIR / uuid
-        
-        # Check if pack with this UUID already exists
-        if dest_folder.exists():
+            uuid = manifest_data["header"]["uuid"]
+        except json.JSONDecodeError:
+            QMessageBox.critical(self, "Invalid Manifest", "Manifest.json is not valid JSON.")
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Invalid Manifest", f"Error reading manifest: {str(e)}")
+            return
+
+        encrypt_success = False
+        if self.encrypt_checkbox.isChecked():
+            manifest_choice = self.manifest_dropdown.currentText()
             reply = QMessageBox.question(
                 self,
-                "Pack Already Exists",
-                f"A pack with UUID {uuid} already exists.\n\n"
-                f"Existing: {dest_folder}\n"
-                f"New: {self.merged_pack_path}\n\n"
-                "Replace it?",
+                "Encrypt Pack",
+                f"Encrypt merged pack with manifest: {manifest_choice}?\n\n"
+                "This will replace the current manifest with the selected one.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            
-            if reply != QMessageBox.StandardButton.Yes:
-                self.log_output.appendPlainText("⏭️ Import cancelled - pack already exists")
+            if reply == QMessageBox.StandardButton.Yes:
+                self.log_output.appendPlainText("\n🔐 Starting encryption process...")
+                encrypt_success = self.encrypt_merged_pack(self.merged_pack_path, manifest_choice)
+                if not encrypt_success:
+                    self.log_output.appendPlainText("\n⚠️ Standard encryption failed, trying direct method...")
+                    encrypt_success = self.encrypt_merged_pack_direct(self.merged_pack_path, manifest_choice)
+                if not encrypt_success:
+                    QMessageBox.critical(
+                        self,
+                        "Encryption Failed",
+                        "Failed to encrypt the merged pack.\n\n"
+                        "The pack will NOT be imported.\n"
+                        "Please check the log for details."
+                    )
+                    return
+                self.log_output.appendPlainText("✅ Encryption completed successfully!")
+            else:
+                self.log_output.appendPlainText("\n⏭️ Encryption cancelled by user. Import aborted.")
                 return
-                
-            # Remove existing pack
-            shutil.rmtree(dest_folder, ignore_errors=True)
-            self.log_output.appendPlainText(f"  ✓ Removed existing pack")
-        
-        # Copy merged pack to Minecraft directory
-        shutil.copytree(self.merged_pack_path, dest_folder)
-        self.log_output.appendPlainText(f"  ✓ Copied to: {dest_folder}")
-        
-        # Update installed packs state
-        if hasattr(self.parent, 'scan_local'):
-            self.parent.scan_local()
-            if hasattr(self.parent, 'refresh_installed'):
-                self.parent.refresh_installed()
-        
-        self.log_output.appendPlainText(f"\n✅ Merged pack imported to Minecraft!")
-        self.log_output.appendPlainText(f"   UUID: {uuid}")
-        self.log_output.appendPlainText(f"   Location: {dest_folder}")
-        self.log_output.appendPlainText(f"\n✨ Restart Minecraft to see it in the dressing room!")
-        
-        QMessageBox.information(
-            self, 
-            "Import Successful", 
-            f"Merged pack imported to Minecraft!\n\n"
-            f"UUID: {uuid}\n"
-            f"Encrypted: {'Yes' if encrypt_success else 'No'}\n\n"
-            f"Restart Minecraft to see it in the dressing room."
-        )
-        
-     except Exception as e:
-        self.log_output.appendPlainText(f"\n❌ Import failed: {e}")
-        import traceback
-        self.log_output.appendPlainText(f"Traceback: {traceback.format_exc()}")
-        QMessageBox.critical(self, "Import Failed", f"Failed to import merged pack: {e}")
+        else:
+            self.log_output.appendPlainText("\n⏭️ Encryption not requested")
+
+        try:
+            dest_folder = SKIN_PACK_DIR / uuid
+            if dest_folder.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Pack Already Exists",
+                    f"A pack with UUID {uuid} already exists.\n\n"
+                    f"Existing: {dest_folder}\n"
+                    f"New: {self.merged_pack_path}\n\n"
+                    "Replace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.log_output.appendPlainText("⏭️ Import cancelled - pack already exists")
+                    return
+                shutil.rmtree(dest_folder, ignore_errors=True)
+                self.log_output.appendPlainText(f"  ✓ Removed existing pack")
+
+            dest_folder.mkdir(parents=True, exist_ok=True)
+
+            # The folder containing manifest.json is the pack root
+            pack_root = manifest_path.parent
+            for item in pack_root.iterdir():
+                shutil.move(str(item), str(dest_folder / item.name))
+
+            # Remove the entire merged pack folder
+            shutil.rmtree(self.merged_pack_path, ignore_errors=True)
+            self.log_output.appendPlainText(f"  ✓ Copied contents to: {dest_folder}")
+
+            if hasattr(self.parent, 'scan_local'):
+                self.parent.scan_local()
+                if hasattr(self.parent, 'refresh_installed'):
+                    self.parent.refresh_installed()
+
+            self.log_output.appendPlainText(f"\n✅ Merged pack imported to Minecraft!")
+            self.log_output.appendPlainText(f"   UUID: {uuid}")
+            self.log_output.appendPlainText(f"   Location: {dest_folder}")
+            self.log_output.appendPlainText(f"\n✨ Restart Minecraft to see it in the dressing room!")
+
+            QMessageBox.information(
+                self,
+                "Import Successful",
+                f"Merged pack imported to Minecraft!\n\n"
+                f"UUID: {uuid}\n"
+                f"Encrypted: {'Yes' if encrypt_success else 'No'}\n\n"
+                f"Restart Minecraft to see it in the dressing room."
+            )
+
+        except Exception as e:
+            self.log_output.appendPlainText(f"\n❌ Import failed: {e}")
+            import traceback
+            self.log_output.appendPlainText(f"Traceback: {traceback.format_exc()}")
+            QMessageBox.critical(self, "Import Failed", f"Failed to import merged pack: {e}")
 
 # ---------------- MAIN APP ----------------
 class App(QMainWindow):
@@ -1243,68 +1073,47 @@ class App(QMainWindow):
         self.legacy_packs = []
         self.injection_worker = None
         self.sound = None
-        self.sound_enabled = True  # Sound enabled by default
+        self.sound_enabled = True
         self.setWindowTitle("Melancholy")
-        self.setWindowIcon(QIcon(resource_path("icon.ico")))
+        self.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
         self.resize(1300, 900)
-        
-        # Set transparent background
+
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_NoSystemBackground)
-        
-        # Create background widget
+
         self.background = BackgroundWidget(self)
         self.background.lower()
         self.background.setGeometry(self.rect())
-        
-        # Initialize sound
+
         self.init_sound()
-        
-        # Play startup sound if enabled
+        self.load_settings()
         if self.sound_enabled:
             QTimer.singleShot(100, self.play_startup_sound)
-        
+
+        # Load hover and click sounds
+        self.hover_sound = self.load_sound("hover.wav")
+        self.click_sound = self.load_sound("click.wav")
+
         self.state = load_state()
         if "known" not in self.state or not isinstance(self.state["known"], list):
             self.state["known"] = []
-            
         self.legacy_state = load_legacy_state()
-        
+
         self.splash.show_message("Scanning local packs...")
         self.scan_local()
 
         central = QWidget()
         self.setCentralWidget(central)
-        
         central.setAttribute(Qt.WA_StyledBackground)
         central.setStyleSheet("QWidget { background-color: transparent; }")
-        
         main_layout = QVBoxLayout(central)
 
-        # Top bar
         top_bar = QHBoxLayout()
         top_bar.addStretch()
-        
-        # Sound toggle button (replaces Set Sound button)
-        self.sound_toggle_btn = QPushButton("🔊 Sound On")
-        self.sound_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(0,150,0,100);
-                border: 1px solid rgba(0,255,0,150);
-                border-radius: 5px;
-                color: white;
-                padding: 5px 15px;
-                margin-right: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(0,150,0,150);
-            }
-        """)
+        self.sound_toggle_btn = SoundButton("", self.hover_sound, self.click_sound)
         self.sound_toggle_btn.clicked.connect(self.toggle_sound)
         top_bar.addWidget(self.sound_toggle_btn)
-        
-        credits_btn = QPushButton("Credits")
+        credits_btn = SoundButton("Credits", self.hover_sound, self.click_sound)
         credits_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(0,0,0,100);
@@ -1322,29 +1131,29 @@ class App(QMainWindow):
         top_bar.addWidget(credits_btn)
         main_layout.addLayout(top_bar)
 
-        # Tabs
+        self.update_sound_button()
+
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
             QTabWidget { background-color: transparent; }
-            QTabWidget::pane { 
+            QTabWidget::pane {
                 background-color: rgba(20, 20, 20, 180);
                 border: 1px solid rgba(255, 255, 255, 50);
                 border-radius: 10px;
             }
         """)
         main_layout.addWidget(self.tabs)
-        
+
         self.splash.show_message("Building interface...")
-        
         self.store_tab = QWidget()
         self.installed_tab = QWidget()
         self.porter_tab = QWidget()
-        self.merger_tab = MergerTab(self)  # Pass self as parent
-        
+        self.merger_tab = MergerTab(self, self.hover_sound, self.click_sound)
+
         for tab in [self.store_tab, self.installed_tab, self.porter_tab]:
             tab.setAttribute(Qt.WA_StyledBackground)
             tab.setStyleSheet("background-color: transparent;")
-            
+
         self.tabs.addTab(self.store_tab, "Store")
         self.tabs.addTab(self.installed_tab, "Installed")
         self.tabs.addTab(self.porter_tab, "Porter")
@@ -1352,19 +1161,15 @@ class App(QMainWindow):
 
         self.splash.show_message("Building store...")
         self.build_store()
-        
         self.splash.show_message("Building installed tab...")
         self.build_installed()
-        
         self.splash.show_message("Building porter...")
         self.build_porter()
-        
         self.splash.show_message("Loading store...")
         self.load_store()
-        
+
         self.tabs.currentChanged.connect(lambda _: self.refresh_installed())
 
-        # Fade-in animation
         self.setWindowOpacity(0)
         self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
         self.fade_anim.setDuration(1500)
@@ -1372,53 +1177,44 @@ class App(QMainWindow):
         self.fade_anim.setEndValue(1)
         self.fade_anim.setEasingCurve(QEasingCurve.InOutCubic)
         self.fade_anim.start()
-        
         QTimer.singleShot(2000, self.splash.close)
-        
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.background.setGeometry(self.rect())
-        
-    def init_sound(self):
-        """Initialize sound system - looks for startup_sound.wav in multiple locations"""
+
+    def load_sound(self, filename):
+        """Load a sound file from various locations, prioritizing assets folder."""
+        sound = QSoundEffect()
+        sound.setLoopCount(1)
+        sound.setVolume(0.5)
+        paths = [
+            Path(resource_path(f"assets/{filename}")),
+            Path(os.getcwd()) / "assets" / filename,
+            Path(resource_path(filename)),
+            Path(os.getcwd()) / filename,
+        ]
+        for p in paths:
+            if p.exists():
+                sound.setSource(QUrl.fromLocalFile(str(p)))
+                print(f"Loaded sound: {p}")
+                return sound
+        print(f"Sound not found: {filename}")
+        return None
+
+    def load_settings(self):
+        settings = {}
+        if SETTINGS_FILE.exists():
+            try:
+                settings = json.loads(SETTINGS_FILE.read_text())
+            except Exception:
+                pass
+        self.sound_enabled = settings.get("sound_enabled", True)
+
+    def save_settings(self):
+        settings = {"sound_enabled": self.sound_enabled}
         try:
-            self.sound = QSoundEffect()
-            self.sound.setLoopCount(1)
-            self.sound.setVolume(0.8)
-            
-            # Look for startup sound in multiple locations
-            sound_locations = [
-                Path(os.getcwd()) / "startup_sound.wav",  # Current directory
-                Path(os.getcwd()) / "startup_sound.mp3",  # Current directory mp3
-                Path(os.getcwd()) / "assets" / "startup_sound.wav",  # Assets folder
-                SOUND_FILE,  # AppData location
-                Path(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)) / "startup_sound.wav"  # Script directory
-            ]
-            
-            sound_found = False
-            for sound_path in sound_locations:
-                if sound_path.exists():
-                    self.sound.setSource(QUrl.fromLocalFile(str(sound_path)))
-                    print(f"Found startup sound: {sound_path}")
-                    sound_found = True
-                    break
-            
-            if sound_found:
-                self.sound_available = True
-                print("✅ Startup sound loaded successfully")
-            else:
-                self.sound_available = False
-                print("ℹ️ No startup sound found - using fallback beeps")
-                
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
         except Exception as e:
-            print(f"Sound system not available: {e}")
-            self.sound_available = False
-            self.sound = None
-    
-    def toggle_sound(self):
-        """Toggle startup sound on/off"""
-        self.sound_enabled = not self.sound_enabled
-        
+            print(f"Failed to save settings: {e}")
+
+    def update_sound_button(self):
         if self.sound_enabled:
             self.sound_toggle_btn.setText("🔊 Sound On")
             self.sound_toggle_btn.setStyleSheet("""
@@ -1435,8 +1231,6 @@ class App(QMainWindow):
                     background-color: rgba(0,150,0,150);
                 }
             """)
-            # Test the sound to confirm it's working
-            self.play_startup_sound()
         else:
             self.sound_toggle_btn.setText("🔇 Sound Off")
             self.sound_toggle_btn.setStyleSheet("""
@@ -1453,25 +1247,66 @@ class App(QMainWindow):
                     background-color: rgba(150,150,150,150);
                 }
             """)
-        
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.background.setGeometry(self.rect())
+
+    def init_sound(self):
+        try:
+            self.sound = QSoundEffect()
+            self.sound.setLoopCount(1)
+            self.sound.setVolume(0.8)
+            sound_locations = [
+                Path(resource_path("assets/startup_sound.wav")),
+                Path(os.getcwd()) / "assets" / "startup_sound.wav",
+                Path(resource_path("startup_sound.wav")),
+                Path(os.getcwd()) / "startup_sound.wav",
+                Path(os.getcwd()) / "startup_sound.mp3",
+                Path(os.getcwd()) / "assets" / "startup_sound.mp3",
+                SOUND_FILE,
+                Path(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)) / "startup_sound.wav"
+            ]
+            sound_found = False
+            for sound_path in sound_locations:
+                if sound_path.exists():
+                    self.sound.setSource(QUrl.fromLocalFile(str(sound_path)))
+                    print(f"Found startup sound: {sound_path}")
+                    sound_found = True
+                    break
+            if sound_found:
+                self.sound_available = True
+                print("✅ Startup sound loaded successfully")
+            else:
+                self.sound_available = False
+                print("ℹ️ No startup sound found - using fallback beeps")
+        except Exception as e:
+            print(f"Sound system not available: {e}")
+            self.sound_available = False
+            self.sound = None
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        self.update_sound_button()
+        self.save_settings()
+        if not self.sound_enabled and self.sound and self.sound.isPlaying():
+            self.sound.stop()
+
     def play_startup_sound(self):
-        """Play startup sound only if enabled"""
         if not self.sound_enabled:
             return
-            
         try:
             if self.sound_available and self.sound and self.sound.source().isValid():
                 self.sound.play()
                 print("Playing startup sound")
             else:
-                # Only use beeps as absolute last resort
                 try:
                     import winsound
                     winsound.Beep(800, 200)
                     winsound.Beep(1000, 200)
                     winsound.Beep(1200, 400)
                 except:
-                    pass  # Silently fail if no sound available
+                    pass
         except:
             pass
 
@@ -1480,26 +1315,28 @@ class App(QMainWindow):
         if hasattr(self, 'porter_status'):
             self.porter_status.append(f"📂 Selected folder via drag-drop: {path}")
 
-    # -------------- Local scan --------------
     def scan_local(self):
         self.state["known"] = []
         for folder in SKIN_PACK_DIR.iterdir():
-            if not folder.is_dir(): continue
+            if not folder.is_dir():
+                continue
             manifest = find_manifest(folder)
-            if not manifest: continue
+            if not manifest:
+                continue
             try:
                 uuid, version = read_manifest(manifest)
-            except: continue
+            except:
+                continue
+            display_name = get_pack_display_name(folder)
             self.state["known"].append({
                 "uuid": uuid,
                 "version": version,
                 "path": str(folder),
-                "store_name": folder.name,
+                "store_name": display_name,
                 "source": "local"
             })
         save_state(self.state)
 
-    # -------------- Credits --------------
     def show_credits(self):
         discord_url = "https://discord.gg/3x3M289anm"
         msg = QMessageBox(self)
@@ -1535,9 +1372,31 @@ class App(QMainWindow):
         if msg.clickedButton() == discord_btn:
             QDesktopServices.openUrl(QUrl(discord_url))
 
-    # ---------------- STORE ----------------
     def build_store(self):
         root = QVBoxLayout(self.store_tab)
+        search_layout = QHBoxLayout()
+        search_label = QLabel("🔍 Search:")
+        search_label.setStyleSheet("color: white;")
+        search_layout.addWidget(search_label)
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Type skin pack name...")
+        self.search_bar.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(30,30,30,200);
+                border: 1px solid rgba(255,255,255,100);
+                border-radius: 5px;
+                color: white;
+                padding: 6px;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #4caf50;
+            }
+        """)
+        self.search_bar.textChanged.connect(self.filter_store)
+        search_layout.addWidget(self.search_bar)
+        search_layout.addStretch()
+        root.addLayout(search_layout)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1557,6 +1416,14 @@ class App(QMainWindow):
         root.addWidget(self.progress)
         root.addWidget(self.log)
 
+        self.store_cards = []
+
+    def filter_store(self, text):
+        text_lower = text.lower()
+        for card in self.store_cards:
+            pack_name = card.pack.get("name", "").lower()
+            card.setVisible(text_lower in pack_name)
+
     def load_store(self):
         self.store_loader = StoreLoader()
         self.store_loader.finished.connect(self.populate_store)
@@ -1568,25 +1435,26 @@ class App(QMainWindow):
             w = self.grid.takeAt(0).widget()
             if w:
                 w.deleteLater()
-
+        self.store_cards.clear()
         row = col = 0
         for pack in packs:
-            card = StoreCard(pack, self.state, self.start_download, self.uninstall_pack)
+            card = StoreCard(pack, self.state, self.start_download, self.uninstall_pack,
+                             self.hover_sound, self.click_sound)
             self.grid.addWidget(card, row, col)
+            self.store_cards.append(card)
             col += 1
             if col == 4:
                 col = 0
                 row += 1
+        self.filter_store(self.search_bar.text())
 
     def start_download(self, pack):
         if self.downloading:
             QMessageBox.warning(self, "Download Running", "A download is already in progress.")
             return
-
         self.downloading = True
         self.progress.setValue(0)
         self.log.clear()
-
         self.worker = DownloadWorker(pack["zip_url"])
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self.log.append)
@@ -1602,31 +1470,32 @@ class App(QMainWindow):
         self.downloading = False
         QMessageBox.critical(self, "Download Error", err)
 
-    # ---------------- INSTALL PACK ----------------
     def install_pack(self, tmp_zip: Path, pack):
         self.log.append("Preparing installation…")
-
         try:
             temp_extract = SKIN_PACK_DIR / "__temp_install__"
             if temp_extract.exists():
                 shutil.rmtree(temp_extract)
             temp_extract.mkdir()
-
             with zipfile.ZipFile(tmp_zip, "r") as z:
                 z.extractall(temp_extract)
 
-            manifest_path = find_manifest(temp_extract)
+            # Find manifest.json anywhere in the extracted tree
+            manifest_path = None
+            for root, dirs, files in os.walk(temp_extract):
+                if "manifest.json" in files:
+                    manifest_path = Path(root) / "manifest.json"
+                    break
+
             if not manifest_path:
                 raise Exception("manifest.json not found in pack")
 
             new_uuid, version = read_manifest(manifest_path)
-
             existing = next(
                 (info for info in self.state.get("known", [])
                  if info.get("uuid") == new_uuid),
                 None
             )
-
             dest_folder = SKIN_PACK_DIR / new_uuid
 
             if existing:
@@ -1660,57 +1529,79 @@ class App(QMainWindow):
                 replace_btn = msg.addButton("Replace", QMessageBox.AcceptRole)
                 cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
                 msg.exec()
-
                 if msg.clickedButton() == cancel_btn:
                     self.log.append("Install cancelled.")
                     shutil.rmtree(temp_extract, ignore_errors=True)
                     return
-
                 old_path = Path(existing["path"])
                 if old_path.exists():
                     shutil.rmtree(old_path, ignore_errors=True)
-
                 self.state["known"].remove(existing)
 
             if dest_folder.exists():
                 shutil.rmtree(dest_folder, ignore_errors=True)
 
-            shutil.move(temp_extract, dest_folder)
+            dest_folder.mkdir(parents=True, exist_ok=True)
 
+            # The folder containing manifest.json is the pack root
+            pack_root = manifest_path.parent
+            for item in pack_root.iterdir():
+                shutil.move(str(item), str(dest_folder / item.name))
+
+            # Remove the entire temp extraction
+            shutil.rmtree(temp_extract, ignore_errors=True)
+
+            display_name = get_pack_display_name(dest_folder)
             self.state["known"].append({
                 "uuid": new_uuid,
                 "version": version,
                 "path": str(dest_folder),
-                "store_name": pack.get("name", new_uuid),
+                "store_name": display_name,
                 "source": "store"
             })
-
             save_state(self.state)
-
             self.log.append("✔ Installation complete.")
             self.refresh_installed()
             self.load_store()
-
-            # Success animation
             self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
             self.fade_anim.setDuration(300)
             self.fade_anim.setKeyValueAt(0, 1)
             self.fade_anim.setKeyValueAt(0.5, 0.8)
             self.fade_anim.setKeyValueAt(1, 1)
             self.fade_anim.start()
-
         except Exception as e:
             QMessageBox.critical(self, "Install failed", str(e))
             self.log.append(f"Error: {e}")
 
-    # ---------------- INSTALLED TAB ----------------
     def build_installed(self):
         layout = QVBoxLayout(self.installed_tab)
         layout.setSpacing(12)
+        search_layout = QHBoxLayout()
+        search_label = QLabel("🔍 Search Installed:")
+        search_label.setStyleSheet("color: white;")
+        search_layout.addWidget(search_label)
+        self.installed_search_bar = QLineEdit()
+        self.installed_search_bar.setPlaceholderText("Type pack name...")
+        self.installed_search_bar.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(30,30,30,200);
+                border: 1px solid rgba(255,255,255,100);
+                border-radius: 5px;
+                color: white;
+                padding: 6px;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #4caf50;
+            }
+        """)
+        self.installed_search_bar.textChanged.connect(self.filter_installed)
+        search_layout.addWidget(self.installed_search_bar)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
 
         btn_row = QHBoxLayout()
-
-        refresh = QPushButton("Refresh")
+        refresh = SoundButton("Refresh", self.hover_sound, self.click_sound)
         refresh.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,255,255,50);
@@ -1725,8 +1616,7 @@ class App(QMainWindow):
         """)
         refresh.clicked.connect(self.refresh_installed)
         btn_row.addWidget(refresh)
-
-        wipe = QPushButton("Safe Wipe")
+        wipe = SoundButton("Safe Wipe", self.hover_sound, self.click_sound)
         wipe.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,0,0,50);
@@ -1741,8 +1631,7 @@ class App(QMainWindow):
         """)
         wipe.clicked.connect(self.safe_wipe)
         btn_row.addWidget(wipe)
-
-        delete_btn = QPushButton("Delete Selected")
+        delete_btn = SoundButton("Delete Selected", self.hover_sound, self.click_sound)
         delete_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,0,0,50);
@@ -1757,7 +1646,6 @@ class App(QMainWindow):
         """)
         delete_btn.clicked.connect(self.delete_selected)
         btn_row.addWidget(delete_btn)
-
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -1789,6 +1677,12 @@ class App(QMainWindow):
 
         self.refresh_installed()
 
+    def filter_installed(self, text):
+        text_lower = text.lower()
+        for i in range(self.installed_list.count()):
+            item = self.installed_list.item(i)
+            item.setHidden(text_lower not in item.text().lower())
+
     def handle_import_drop(self, path):
         try:
             self.install_pack(Path(path), {"name": Path(path).stem})
@@ -1799,16 +1693,16 @@ class App(QMainWindow):
     def refresh_installed(self):
         self.scan_local()
         self.installed_list.clear()
-
         for info in self.state.get("known", []):
-            item = QListWidgetItem(info.get("store_name", "Unnamed Pack"))
+            display_name = info.get("store_name", "Unnamed Pack")
+            item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, info)
             self.installed_list.addItem(item)
+        self.filter_installed(self.installed_search_bar.text())
 
     def show_installed_preview(self, item):
         info = item.data(Qt.UserRole)
         folder = Path(info.get("path", ""))
-
         thumb = folder / "thumbnail.png"
         if thumb.exists():
             pix = QPixmap(str(thumb))
@@ -1822,24 +1716,18 @@ class App(QMainWindow):
         item = self.installed_list.currentItem()
         if not item:
             return
-
         info = item.data(Qt.UserRole)
-
         reply = QMessageBox.question(
             self,
             "Delete Pack",
             f"Delete {info.get('store_name', 'pack')}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
-
         shutil.rmtree(info.get("path", ""), ignore_errors=True)
-
         self.state["known"].remove(info)
         save_state(self.state)
-
         self.refresh_installed()
         self.load_store()
 
@@ -1850,29 +1738,23 @@ class App(QMainWindow):
             "Remove ALL installed skin packs?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
-
         for info in list(self.state.get("known", [])):
             shutil.rmtree(info.get("path", ""), ignore_errors=True)
-
         self.state["known"] = []
         save_state(self.state)
-
         self.refresh_installed()
         self.load_store()
 
-    # ---------------- PORTER TAB ----------------
     def build_porter(self):
         layout = QVBoxLayout(self.porter_tab)
-
         title = QLabel("Porter – Copy → Encrypt → Import")
         title.setStyleSheet("color: white; font-size: 16px; font-weight: bold; padding: 10px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        self.porter_folder_btn = QPushButton("Select Folder")
+        self.porter_folder_btn = SoundButton("Select Folder", self.hover_sound, self.click_sound)
         self.porter_folder_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(255,255,255,50);
@@ -1904,7 +1786,7 @@ class App(QMainWindow):
         self.porter_progress.setValue(0)
         layout.addWidget(self.porter_progress)
 
-        self.porter_run_btn = QPushButton("Run Porter")
+        self.porter_run_btn = SoundButton("Run Porter", self.hover_sound, self.click_sound)
         self.porter_run_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(0,255,0,50);
@@ -1936,84 +1818,64 @@ class App(QMainWindow):
         if self.porter_running:
             QMessageBox.warning(self, "Porter Running", "Porter is already processing.")
             return
-
         if not hasattr(self, "porter_folder") or not self.porter_folder:
             QMessageBox.warning(self, "Porter", "Select a folder first")
             return
-
         self.porter_running = True
         self.porter_progress.setValue(0)
-
         try:
             folder = self.porter_folder
             choice = self.manifest_dropdown.currentText()
-
             self.porter_status.append("📁 Copying pack...")
             temp_copy = copy_pack_first(folder)
             self.porter_progress.setValue(25)
-
             self.porter_status.append("🧾 Setting manifest...")
             setup_porter(temp_copy, choice)
             self.porter_progress.setValue(50)
-
             self.porter_status.append("🔐 Encrypting...")
             tool_porter(temp_copy)
             self.porter_progress.setValue(75)
-
             self.porter_status.append("🔎 Checking for existing packs...")
             self.remove_existing_manifest_pack(temp_copy)
-
             self.porter_status.append("📦 Importing...")
             import_to_minecraft_porter(temp_copy)
-
             self.porter_progress.setValue(100)
-
             self.porter_status.append("✅ Done")
-            
             self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
             self.fade_anim.setDuration(300)
             self.fade_anim.setKeyValueAt(0, 1)
             self.fade_anim.setKeyValueAt(0.5, 0.8)
             self.fade_anim.setKeyValueAt(1, 1)
             self.fade_anim.start()
-
         except Exception as e:
             QMessageBox.critical(self, "Porter Error", str(e))
             self.porter_status.append(f"❌ {e}")
-
         finally:
             self.porter_running = False
 
     def uninstall_pack(self, pack):
         name = pack.get("name")
-
         existing = next(
             (info for info in self.state.get("known", [])
              if info.get("store_name") == name),
             None
         )
-
         if not existing:
             QMessageBox.information(self, "Uninstall", "Pack not found.")
             return
-
         reply = QMessageBox.question(
             self,
             "Uninstall Pack",
             f"Uninstall {name}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
-
         path = existing.get("path")
         if path and os.path.exists(path):
             shutil.rmtree(path, ignore_errors=True)
-
         self.state["known"].remove(existing)
         save_state(self.state)
-
         self.refresh_installed()
         self.load_store()
 
@@ -2140,15 +2002,28 @@ def tool_porter(inputPath):
         fileContents.write(headerFinal)
 
 def import_to_minecraft_porter(temp_path):
-    manifest = Path(temp_path) / "manifest.json"
-    if not manifest.exists():
-        raise Exception("manifest.json missing after porter")
+    """Move the processed skin pack into Minecraft's skin_packs folder (contents only)."""
+    # Locate manifest.json (should be in the root, but walk just in case)
+    manifest = None
+    for root, dirs, files in os.walk(temp_path):
+        if "manifest.json" in files:
+            manifest = Path(root) / "manifest.json"
+            break
+    if not manifest:
+        raise Exception("manifest.json not found after porter")
     data = json.loads(manifest.read_text(encoding="utf-8"))
     uuid = data["header"]["uuid"]
     dest_folder = SKIN_PACK_DIR / uuid
     if dest_folder.exists():
         shutil.rmtree(dest_folder, ignore_errors=True)
-    shutil.move(temp_path, dest_folder)
+    dest_folder.mkdir(parents=True, exist_ok=True)
+
+    # The folder containing manifest.json is the pack root
+    pack_root = manifest.parent
+    for item in pack_root.iterdir():
+        shutil.move(str(item), str(dest_folder / item.name))
+
+    shutil.rmtree(temp_path, ignore_errors=True)
 
 def copy_pack_first(folder):
     temp_root = os.path.join(tempfile.gettempdir(), "porter_temp")
@@ -2162,24 +2037,14 @@ def copy_pack_first(folder):
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    myappid = 'ecliptix.melancholy.1.0'
+    myappid = 'ecliptix.melancholy.1.1.2'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(resource_path("icon.ico")))
-    
-    # Set application-wide transparent style
+    app.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
     app.setStyle('Fusion')
-    
-    # Create and show loading screen
     splash = LoadingScreen()
     splash.show()
     app.processEvents()
-    
-    # Create main window (loading screen will be closed after initialization)
     win = App(splash)
-    
-    # Show main window after a delay
     QTimer.singleShot(2500, win.show)
-    
     sys.exit(app.exec())
