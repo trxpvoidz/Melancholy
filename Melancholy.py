@@ -118,7 +118,7 @@ def read_manifest(path):
 
 def vtuple(v): return tuple(v or [0,0,0])
 
-# ---------------- LOCALIZATION (Improved) ----------------
+# ---------------- LOCALIZATION ----------------
 def get_pack_display_name(pack_path: Path) -> str:
     """
     Get the display name for a skin pack by parsing the first 'skinpack.' entry
@@ -1009,33 +1009,42 @@ class MergerTab(QWidget):
             self.log_output.appendPlainText("\n⏭️ Encryption not requested")
 
         try:
-            dest_folder = SKIN_PACK_DIR / uuid
+            # Determine destination name from the pack root folder (the one containing manifest.json)
+            pack_root = manifest_path.parent
+            dest_name = pack_root.name  # keep original folder name
+            dest_folder = SKIN_PACK_DIR / dest_name
+
+            # Check for existing pack with same UUID (may have different folder name)
+            existing = next((info for info in self.parent.state.get("known", [])
+                             if info.get("uuid") == uuid), None)
+            if existing:
+                old_path = Path(existing["path"])
+                if old_path.exists():
+                    shutil.rmtree(old_path, ignore_errors=True)
+                self.parent.state["known"].remove(existing)
+                self.log_output.appendPlainText(f"  ✓ Removed existing pack with UUID {uuid}")
+
+            # If destination folder already exists (from a different pack), ask user
             if dest_folder.exists():
                 reply = QMessageBox.question(
                     self,
-                    "Pack Already Exists",
-                    f"A pack with UUID {uuid} already exists.\n\n"
-                    f"Existing: {dest_folder}\n"
-                    f"New: {self.merged_pack_path}\n\n"
-                    "Replace it?",
+                    "Folder Name Conflict",
+                    f"A folder named '{dest_name}' already exists.\n"
+                    "Do you want to overwrite it? (This will delete the existing folder.)",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply != QMessageBox.StandardButton.Yes:
-                    self.log_output.appendPlainText("⏭️ Import cancelled - pack already exists")
+                    self.log_output.appendPlainText("⏭️ Import cancelled - folder name conflict")
                     return
                 shutil.rmtree(dest_folder, ignore_errors=True)
-                self.log_output.appendPlainText(f"  ✓ Removed existing pack")
 
-            dest_folder.mkdir(parents=True, exist_ok=True)
+            # Copy the pack root to destination
+            shutil.copytree(pack_root, dest_folder)
 
-            # The folder containing manifest.json is the pack root
-            pack_root = manifest_path.parent
-            for item in pack_root.iterdir():
-                shutil.move(str(item), str(dest_folder / item.name))
-
-            # Remove the entire merged pack folder
+            # Remove the merged pack temp folder
             shutil.rmtree(self.merged_pack_path, ignore_errors=True)
-            self.log_output.appendPlainText(f"  ✓ Copied contents to: {dest_folder}")
+
+            self.log_output.appendPlainText(f"  ✓ Copied pack to: {dest_folder}")
 
             if hasattr(self.parent, 'scan_local'):
                 self.parent.scan_local()
@@ -1464,25 +1473,41 @@ class App(QMainWindow):
 
     def finish_download(self, tmp, pack):
         self.downloading = False
-        self.install_pack(tmp, pack)
+        self.install_pack(tmp, pack, original_name=pack.get("name"))
 
     def download_error(self, err):
         self.downloading = False
         QMessageBox.critical(self, "Download Error", err)
 
-    def install_pack(self, tmp_zip: Path, pack):
+    def install_pack(self, source: Path, pack, original_name=None):
+        """
+        Install a skin pack from a zip file or a folder.
+        - source: path to a .zip file or a folder containing the pack.
+        - pack: dictionary with pack info (used for logging).
+        - original_name: fallback name to use for the folder (store name or source name).
+        """
         self.log.append("Preparing installation…")
         try:
-            temp_extract = SKIN_PACK_DIR / "__temp_install__"
-            if temp_extract.exists():
-                shutil.rmtree(temp_extract)
-            temp_extract.mkdir()
-            with zipfile.ZipFile(tmp_zip, "r") as z:
-                z.extractall(temp_extract)
+            # Determine if source is a zip or a folder
+            is_zip = source.is_file() and source.suffix.lower() == '.zip'
+            if not is_zip and not source.is_dir():
+                raise Exception("Source must be a .zip file or a folder")
 
-            # Find manifest.json anywhere in the extracted tree
+            # For zip, extract to temp folder; for folder, use directly
+            if is_zip:
+                temp_extract = SKIN_PACK_DIR / "__temp_install__"
+                if temp_extract.exists():
+                    shutil.rmtree(temp_extract)
+                temp_extract.mkdir()
+                with zipfile.ZipFile(source, "r") as z:
+                    z.extractall(temp_extract)
+                pack_root_candidate = temp_extract
+            else:
+                pack_root_candidate = source
+
+            # Find manifest.json anywhere in the pack root candidate
             manifest_path = None
-            for root, dirs, files in os.walk(temp_extract):
+            for root, dirs, files in os.walk(pack_root_candidate):
                 if "manifest.json" in files:
                     manifest_path = Path(root) / "manifest.json"
                     break
@@ -1491,13 +1516,10 @@ class App(QMainWindow):
                 raise Exception("manifest.json not found in pack")
 
             new_uuid, version = read_manifest(manifest_path)
-            existing = next(
-                (info for info in self.state.get("known", [])
-                 if info.get("uuid") == new_uuid),
-                None
-            )
-            dest_folder = SKIN_PACK_DIR / new_uuid
 
+            # Check for existing pack with same UUID (may have different folder name)
+            existing = next((info for info in self.state.get("known", [])
+                             if info.get("uuid") == new_uuid), None)
             if existing:
                 msg = QMessageBox(self)
                 msg.setWindowTitle("Existing Pack Found")
@@ -1505,7 +1527,7 @@ class App(QMainWindow):
                     "A pack with the same UUID already exists.\n\n"
                     f"Installed: {existing.get('store_name')}\n"
                     f"UUID: {new_uuid}\n\n"
-                    "Choose what to do:"
+                    "Replace it?"
                 )
                 msg.setStyleSheet("""
                     QMessageBox {
@@ -1531,35 +1553,72 @@ class App(QMainWindow):
                 msg.exec()
                 if msg.clickedButton() == cancel_btn:
                     self.log.append("Install cancelled.")
-                    shutil.rmtree(temp_extract, ignore_errors=True)
+                    if is_zip:
+                        shutil.rmtree(pack_root_candidate, ignore_errors=True)
                     return
                 old_path = Path(existing["path"])
                 if old_path.exists():
                     shutil.rmtree(old_path, ignore_errors=True)
                 self.state["known"].remove(existing)
+                self.log.append(f"  ✓ Removed existing pack with UUID {new_uuid}")
 
+            # Determine destination folder name:
+            # - For store downloads (zip with original_name): use original_name
+            # - For folder: use the folder's name (source.name)
+            # - For zip without original_name: use the zip stem
+            if is_zip:
+                if original_name:
+                    dest_name = original_name
+                else:
+                    dest_name = source.stem
+            else:
+                dest_name = source.name
+
+            dest_folder = SKIN_PACK_DIR / dest_name
+
+            # If destination folder already exists (from a different pack), ask user
             if dest_folder.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Folder Name Conflict",
+                    f"A folder named '{dest_name}' already exists.\n"
+                    "Do you want to overwrite it? (This will delete the existing folder.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.log.append("Install cancelled - folder name conflict.")
+                    if is_zip:
+                        shutil.rmtree(pack_root_candidate, ignore_errors=True)
+                    return
                 shutil.rmtree(dest_folder, ignore_errors=True)
-
-            dest_folder.mkdir(parents=True, exist_ok=True)
 
             # The folder containing manifest.json is the pack root
             pack_root = manifest_path.parent
-            for item in pack_root.iterdir():
-                shutil.move(str(item), str(dest_folder / item.name))
 
-            # Remove the entire temp extraction
-            shutil.rmtree(temp_extract, ignore_errors=True)
+            # Copy the pack root to destination
+            shutil.copytree(pack_root, dest_folder)
 
+            # Remove temp folder if we extracted a zip
+            if is_zip:
+                shutil.rmtree(pack_root_candidate, ignore_errors=True)
+
+            # Compute display name: try lang files first, fallback to original_name or folder name
             display_name = get_pack_display_name(dest_folder)
+            if display_name == dest_folder.name:  # no lang entry found
+                if original_name:
+                    display_name = original_name
+                else:
+                    display_name = dest_folder.name
+
             self.state["known"].append({
                 "uuid": new_uuid,
                 "version": version,
                 "path": str(dest_folder),
                 "store_name": display_name,
-                "source": "store"
+                "source": "store" if is_zip else "local"
             })
             save_state(self.state)
+
             self.log.append("✔ Installation complete.")
             self.refresh_installed()
             self.load_store()
@@ -1649,10 +1708,10 @@ class App(QMainWindow):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+        # Drag & drop area for both zip files and folders
         self.import_drop = DragDropWidget(
-            "Click or Drag & Drop ZIP Here to Import",
-            file_types=[".zip"],
-            folder_mode=False,
+            "Click or Drag & Drop ZIP or Skin Pack Folder Here to Import",
+            folder_mode=True,   # allow folders
             callback=self.handle_import_drop
         )
         layout.addWidget(self.import_drop)
@@ -1684,11 +1743,16 @@ class App(QMainWindow):
             item.setHidden(text_lower not in item.text().lower())
 
     def handle_import_drop(self, path):
-        try:
-            self.install_pack(Path(path), {"name": Path(path).stem})
-            self.refresh_installed()
-        except Exception as e:
-            QMessageBox.critical(self, "Import Error", str(e))
+        """Handle dropped file or folder."""
+        p = Path(path)
+        if p.is_dir():
+            # Import folder directly
+            self.install_pack(p, {"name": p.stem}, original_name=p.stem)
+        elif p.is_file() and p.suffix.lower() == '.zip':
+            # Import zip
+            self.install_pack(p, {"name": p.stem}, original_name=p.stem)
+        else:
+            QMessageBox.warning(self, "Invalid File", "Only .zip files and skin pack folders are supported.")
 
     def refresh_installed(self):
         self.scan_local()
@@ -2037,7 +2101,7 @@ def copy_pack_first(folder):
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    myappid = 'ecliptix.melancholy.1.1.1'
+    myappid = 'ecliptix.melancholy.1.1.3'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
@@ -2048,4 +2112,3 @@ if __name__ == "__main__":
     win = App(splash)
     QTimer.singleShot(2500, win.show)
     sys.exit(app.exec())
-
