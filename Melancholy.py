@@ -4,11 +4,12 @@ Copyright (c) 2026 TrxpVoidz (Ecliptix)
 All rights reserved.
 """
 
-import sys, os, json, zipfile, shutil, tempfile, ctypes, time, subprocess, winreg
+import sys, os, json, zipfile, shutil, ctypes, time, subprocess, winreg
 from pathlib import Path
 from io import BytesIO
 from hashlib import sha256
 from base64 import b64encode
+from functools import lru_cache
 
 import requests
 from PIL import Image
@@ -17,7 +18,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea,
     QMessageBox, QProgressBar, QTextEdit, QTabWidget,
     QFileDialog, QListWidget, QListWidgetItem, QComboBox, QSplashScreen,
-    QSizePolicy, QLineEdit, QPlainTextEdit, QCheckBox, QFrame, QGraphicsOpacityEffect
+    QSizePolicy, QLineEdit, QPlainTextEdit, QCheckBox, QFrame, QGraphicsOpacityEffect,
+    QDialog, QFormLayout
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QDesktopServices, QPainter, QColor, QBrush,
@@ -35,10 +37,18 @@ try:
 except ImportError:
     psutil = None
 
-# ---------------- CONSTANTS ----------------
+# ---------- CONSTANTS ----------
 DISCORD_INVITE = "https://discord.gg/3x3M289anm"
 GITHUB_URL     = "https://github.com/trxpvoidz/Melancholy"
-APP_VERSION    = "1.1.5"
+APP_VERSION    = "1.1.6"
+MARKETPLACE_URL = "https://raw.githubusercontent.com/trxpvoidz/Skin-Pack-Store-Importer/main/store.json"
+
+# Persistent HTTP session
+http_session = requests.Session()
+http_session.headers.update({'User-Agent': 'Melancholy/1.1.6'})
+
+# Pagination constant
+STORE_ITEMS_PER_PAGE = 12   # 4 columns x 3 rows
 
 DARK_STYLESHEET = """
     QMainWindow { background: transparent; }
@@ -68,6 +78,9 @@ DARK_STYLESHEET = """
     QCheckBox::indicator { width: 16px; height: 16px; }
     QMessageBox { background-color: #2e2e2e; color: #e0e0e0; }
     QMessageBox QLabel { color: #e0e0e0; }
+    QDialog { background-color: #2e2e2e; color: #e0e0e0; }
+    QTextEdit { background: rgba(255,255,255,5); color: #e0e0e0; border: 1px solid #555; border-radius: 6px; }
+    QPlainTextEdit { background: rgba(255,255,255,5); color: #e0e0e0; border: 1px solid #555; border-radius: 6px; }
 """
 
 LIGHT_STYLESHEET = """
@@ -98,9 +111,12 @@ LIGHT_STYLESHEET = """
     QCheckBox::indicator { width: 16px; height: 16px; }
     QMessageBox { background-color: #f0f0f0; color: #222; }
     QMessageBox QLabel { color: #222; }
+    QDialog { background-color: #f0f0f0; color: #222; }
+    QTextEdit { background: rgba(0,0,0,5); color: #222; border: 1px solid #aaa; border-radius: 6px; }
+    QPlainTextEdit { background: rgba(0,0,0,5); color: #222; border: 1px solid #aaa; border-radius: 6px; }
 """
 
-# ---------------- RESOURCE PATH ----------------
+# ---------- RESOURCE PATH ----------
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -108,7 +124,7 @@ def resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-# ---------------- CUSTOM WARNING POPUP ----------------
+# ---------- WARNING POPUP ----------
 def show_warning(parent, title, message):
     msg = QMessageBox(QMessageBox.Warning, title, message, parent=parent)
     icon_path = resource_path("assets/Warning_alex.png")
@@ -116,7 +132,8 @@ def show_warning(parent, title, message):
         msg.setIconPixmap(QPixmap(icon_path).scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
     return msg.exec()
 
-# ---------------- FONT LOADING ----------------
+# ---------- FONT LOADING ----------
+@lru_cache(maxsize=1)
 def load_minecraft_font():
     font_path = resource_path("assets/Minecraft-Seven_v2.ttf")
     if not os.path.exists(font_path):
@@ -127,7 +144,7 @@ def load_minecraft_font():
     family = QFontDatabase.applicationFontFamilies(font_id)[0]
     return QFont(family, 10)
 
-# ---------------- VERSION DETECTION & PATHS ----------------
+# ---------- VERSION DETECTION & PATHS ----------
 def get_mc_paths(use_uwp):
     if use_uwp:
         skin = Path(os.getenv("LOCALAPPDATA")) / "Packages" / \
@@ -202,17 +219,28 @@ if USE_UWP is None:
     settings["theme"] = "dark"
     settings["custom_background"] = ""
     settings["light_custom_background"] = ""
+    settings["store_presets"] = {
+        "Official Store": MARKETPLACE_URL
+    }
+    settings["active_store_preset"] = "Official Store"
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
 SKIN_PACK_DIR, PERSONA_DIR = get_mc_paths(USE_UWP)
+CACHE_DIR = Path(os.getenv("APPDATA")) / "Melancholy" / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LEGACY_VAULT_DIR = SKIN_PACK_DIR.parent / "legacy_vault"
 LEGACY_VAULT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = SKIN_PACK_DIR / ".skinpack_manager_state.json"
 LEGACY_STATE_FILE = LEGACY_VAULT_DIR / ".legacy_vault_state.json"
-MARKETPLACE_URL = "https://raw.githubusercontent.com/trxpvoidz/Skin-Pack-Store-Importer/main/store.json"
 
-# ---------------- STATE ----------------
+if "store_presets" not in settings or not settings["store_presets"]:
+    settings["store_presets"] = {"Official Store": MARKETPLACE_URL}
+    settings["active_store_preset"] = "Official Store"
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+# ---------- STATE ----------
 def load_state():
     state = {"known": [], "capes": []}
     if STATE_FILE.exists():
@@ -241,7 +269,7 @@ def load_legacy_state():
 def save_legacy_state(state):
     LEGACY_STATE_FILE.write_text(json.dumps(state, indent=2))
 
-# ---------------- MANIFEST ----------------
+# ---------- MANIFEST ----------
 def find_manifest(folder):
     for r, _, f in os.walk(folder):
         if "manifest.json" in f:
@@ -252,7 +280,7 @@ def read_manifest(path):
     data = json.loads(path.read_text())
     return data["header"]["uuid"], data["header"].get("version", [0,0,0])
 
-# ---------------- LOCALIZATION ----------------
+# ---------- LOCALIZATION ----------
 def get_pack_display_name(pack_path: Path) -> str:
     texts_dir = pack_path / "texts"
     if texts_dir.exists():
@@ -270,7 +298,7 @@ def get_pack_display_name(pack_path: Path) -> str:
                 continue
     return pack_path.name
 
-# ---------------- SKIN PACK MERGER UTILITIES ----------------
+# ---------- SKIN PACK MERGER UTILITIES ----------
 def merge_geometry_json(files: list[Path], output_path: Path) -> None:
     geo_dicts = []
     for f in files:
@@ -360,7 +388,58 @@ def merge_multiple_skinpacks(pack_dirs: list[Path], output_dir: Path, log_callba
         merge_geometry_json(geometry_files, output_dir / "geometry.json")
     log("Merge complete.")
 
-# ---------------- BACKGROUND WIDGET ----------------
+# ---------- STORE PRESET DIALOG ----------
+class StorePresetDialog(QDialog):
+    def __init__(self, parent=None, preset_name="", preset_url=""):
+        super().__init__(parent)
+        self.setWindowTitle("Add/Edit Store Preset")
+        self.setMinimumWidth(400)
+        self.setStyleSheet(QApplication.instance().styleSheet())
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(preset_name)
+        self.url_edit = QLineEdit(preset_url)
+        form.addRow("Name:", self.name_edit)
+        form.addRow("URL:", self.url_edit)
+        layout.addLayout(form)
+
+        btn_layout = QHBoxLayout()
+        self.test_btn = QPushButton("Test Store")
+        self.test_btn.clicked.connect(self.test_store)
+        btn_layout.addWidget(self.test_btn)
+        btn_layout.addStretch()
+
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.ok_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def test_store(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Invalid", "Enter a URL.")
+            return
+        self.test_btn.setEnabled(False)
+        try:
+            r = http_session.get(url, timeout=10)
+            data = r.json()
+            if "packs" in data and isinstance(data["packs"], list):
+                QMessageBox.information(self, "Success", f"Store is valid with {len(data['packs'])} packs.")
+            else:
+                QMessageBox.warning(self, "Invalid Store", "JSON missing 'packs' array.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load store:\n{e}")
+        finally:
+            self.test_btn.setEnabled(True)
+
+    def get_data(self):
+        return self.name_edit.text().strip(), self.url_edit.text().strip()
+
+# ---------- BACKGROUND WIDGET ----------
 class BackgroundWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -442,7 +521,7 @@ class BackgroundWidget(QWidget):
             painter.fillRect(self.rect(), QColor(0,0,0,50))
         super().paintEvent(event)
 
-# ---------------- WORKERS ----------------
+# ---------- WORKERS ----------
 class MergerWorker(QThread):
     log = Signal(str)
     progress = Signal(int)
@@ -460,17 +539,24 @@ class MergerWorker(QThread):
             self.finished.emit(True, "Merge completed successfully!")
         except Exception as e:
             self.finished.emit(False, str(e))
+        finally:
+            self.deleteLater()
 
 class StoreLoader(QThread):
     finished = Signal(list)
     error = Signal(str)
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
     def run(self):
         try:
-            r = requests.get(MARKETPLACE_URL, timeout=15)
+            r = http_session.get(self.url, timeout=15)
             packs = r.json()["packs"]
             self.finished.emit(packs)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            self.deleteLater()
 
 class DownloadWorker(QThread):
     progress = Signal(int)
@@ -483,10 +569,10 @@ class DownloadWorker(QThread):
     def run(self):
         try:
             self.log.emit("Starting download...")
-            tmp_dir = Path(tempfile.gettempdir()) / "mcbe_skin_downloads"
+            tmp_dir = CACHE_DIR / "downloads"
             tmp_dir.mkdir(exist_ok=True)
             zip_path = tmp_dir / "pack.zip"
-            r = requests.get(self.url, stream=True, timeout=30)
+            r = http_session.get(self.url, stream=True, timeout=30)
             r.raise_for_status()
             total = int(r.headers.get("Content-Length", 0))
             done = 0
@@ -501,6 +587,8 @@ class DownloadWorker(QThread):
             self.finished.emit(zip_path)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            self.deleteLater()
 
 class ThumbnailLoader(QThread):
     finished = Signal(QPixmap)
@@ -510,7 +598,7 @@ class ThumbnailLoader(QThread):
         self.url = url
     def run(self):
         try:
-            r = requests.get(self.url, timeout=10)
+            r = http_session.get(self.url, timeout=10)
             img = Image.open(BytesIO(r.content))
             img.thumbnail((200, 200))
             buf = BytesIO()
@@ -520,8 +608,10 @@ class ThumbnailLoader(QThread):
             self.finished.emit(pix)
         except:
             self.error.emit()
+        finally:
+            self.deleteLater()
 
-# ---------------- CUSTOM WIDGETS ----------------
+# ---------- CUSTOM WIDGETS ----------
 class SoundButton(QPushButton):
     def __init__(self, text, hover_sound, click_sound, parent=None):
         super().__init__(text, parent)
@@ -556,6 +646,7 @@ class DragDropWidget(QLabel):
         palette = self.palette()
         palette.setColor(QPalette.Window, QColor(0, 0, 0, 80))
         self.setPalette(palette)
+        # Initial style will be overridden by the app's theme application; keep a placeholder.
         self.setStyleSheet("QLabel { border: 2px dashed rgba(255,255,255,80); border-radius: 10px; color: #ccc; }")
         DragDropWidget.instances.append(self)
 
@@ -564,6 +655,8 @@ class DragDropWidget(QLabel):
             self.setStyleSheet("QLabel { border: 2px solid rgba(255,255,255,200); background: rgba(255,255,255,10); border-radius: 10px; color: #fff; }")
             event.acceptProposedAction()
     def dragLeaveEvent(self, event):
+        # Reset to the current theme's dashed style; the app's theme application handles the base style via instances list.
+        # For simplicity, we'll reapply the base style from the instances list later, but here we'll just revert to a default.
         self.setStyleSheet("QLabel { border: 2px dashed rgba(255,255,255,80); border-radius: 10px; color: #ccc; }")
     def dropEvent(self, event):
         self.dragLeaveEvent(event)
@@ -624,6 +717,7 @@ class DragDropWidget(QLabel):
 
 class StoreCard(QWidget):
     instances = []
+    _thumbnail_cache = {}
     def __init__(self, pack, state, install_cb, uninstall_cb, hover_sound, click_sound):
         super().__init__()
         self.pack = pack
@@ -664,6 +758,8 @@ class StoreCard(QWidget):
         self.load_thumb(pack.get("thumbnail"))
         StoreCard.instances.append(self)
         self.destroyed.connect(lambda obj: StoreCard.instances.remove(obj) if obj in StoreCard.instances else None)
+        self._destroyed = False
+        self.destroyed.connect(lambda: setattr(self, '_destroyed', True))
 
     def update_badge(self, state):
         if any(info.get("store_name") == self.pack.get("name") for info in state.get("known", [])):
@@ -674,10 +770,24 @@ class StoreCard(QWidget):
     def load_thumb(self, url):
         if not url:
             return
+        if url in StoreCard._thumbnail_cache:
+            self.thumb.setPixmap(StoreCard._thumbnail_cache[url])
+            return
         self.loader = ThumbnailLoader(url)
-        self.loader.finished.connect(self.thumb.setPixmap)
+        self.loader.finished.connect(lambda pix, u=url: self._on_thumb_loaded(pix, u))
         self.loader.error.connect(lambda: self.thumb.setText("No image"))
         self.loader.start()
+
+    def _on_thumb_loaded(self, pix, url):
+        # Guard against thumbnail arriving after the widget was destroyed
+        if getattr(self, '_destroyed', False):
+            return
+        try:
+            self.thumb.setPixmap(pix)
+            StoreCard._thumbnail_cache[url] = pix
+        except RuntimeError:
+            # Widget was deleted unexpectedly
+            pass
 
 class LoadingScreen(QSplashScreen):
     def __init__(self):
@@ -716,7 +826,7 @@ class LoadingScreen(QSplashScreen):
     def show_message(self, msg):
         self.showMessage(msg, Qt.AlignBottom | Qt.AlignCenter, QColor(255, 255, 255, 200))
 
-# ---------------- HOME TAB ----------------
+# ---------- HOME TAB ----------
 class HomeTab(QWidget):
     def __init__(self, parent, hover_sound, click_sound):
         super().__init__(parent)
@@ -973,7 +1083,7 @@ class HomeTab(QWidget):
         self.help_widget.setStyleSheet(help_frame_style)
         self.help_text.setStyleSheet(f"color: {dim_color}; font-size: 12px; background: transparent;")
 
-# ---------------- SETTINGS TAB ----------------
+# ---------- SETTINGS TAB ----------
 class SettingsTab(QWidget):
     def __init__(self, parent, hover_sound, click_sound):
         super().__init__(parent)
@@ -1010,7 +1120,6 @@ class SettingsTab(QWidget):
         sound_label = QLabel("Sound:")
         self.sound_check = QCheckBox("Enable sounds")
         self.sound_check.setChecked(settings.get("sound_enabled", True))
-        # Use `toggled` signal (sends a bool) instead of `stateChanged`
         self.sound_check.toggled.connect(self.toggle_sound)
         sound_layout.addWidget(sound_label)
         sound_layout.addWidget(self.sound_check)
@@ -1078,7 +1187,188 @@ class SettingsTab(QWidget):
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
-# ---------------- MERGER TAB ----------------
+# ---------------- PORTER / ENCRYPTION FUNCTIONS (move before MergerTab) ----------------
+fileSkip = {'manifest.json', 'pack_icon.png'}
+fileSkipForce = {'contents.json', 'signatures.json'}
+fileSkipFull = fileSkip | fileSkipForce
+key = None
+encryptedVariable = None
+inputPathSkinpack = None
+FIXED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE'
+
+MANIFEST_OPTIONS = {
+    "1st Birthday": '{"header":{"version":[1,0,5],"description":"pack.description","name":"pack.name","uuid":"202539ce-e6c5-40b5-a4a1-4296277d18f6"},"modules":[{"version":[1,0,5],"type":"skin_pack","uuid":"ef6f8811-933b-4673-b285-c02cf583e56d"}],"format_version":1}',
+    "1st Animal Friends": '{"format_version":1,"header":{"name":"1st Animal Friends","uuid":"9a9fa850-0b5e-11ee-9a0f-a795af90f04f","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"a162eb70-0b5e-11ee-86cb-9d9dd4413780","version":[1,0,3]}]}',
+    "Beap Borp HD": '{"header":{"name":"BeepBorpHD","version":[1,0,4],"uuid":"18215a23-e943-4004-b799-48fdcc926799"},"modules":[{"version":[1,0,4],"type":"skin_pack","uuid":"7eb2682d-9532-4db6-aa7e-b4512e347f2e"}],"format_version":1}',
+    "Blockheads": '{"header": {"name": "Blockheads","version": [1,0,0],"uuid": "8b8362a3-cd8c-4f48-9a49-b494659513b6"},"modules": [{"version": [1,0,0],"type": "skin_pack","uuid": "c47ad348-0f17-438f-ae11-6c001445a947"}],"format_version": 1}',
+    "Crafty Costumes": '{"format_version":1,"header":{"name":"CraftyCostumes","uuid":"c35ad990-3dc5-4179-bfe9-6f323d94f0b2","version":[1,0,11]},"modules":[{"type":"skin_pack","uuid":"a568d136-49ec-4287-bbe1-29110643a489","version":[1,0,11]}]}',
+    "Creepy Creatures": '{"header": {"name": "Creepy Creatures","version": [1,0,1],"uuid": "dd44b7d6-2c05-48a2-bfdf-f78596b59f44"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "f84c0b4a-7b0b-4ed3-9125-dffa2815809f"}],"format_version": 1}',
+    "Cute Kitty HD": '{"header":{"name":"CuteKittyHD","version":[1,0,10],"uuid":"7124cf9d-5d0e-4865-9656-03c1f04039c3"},"modules":[{"version":[1,0,10],"type":"skin_pack","uuid":"e9c920a2-fbb1-430a-a951-f240f48c5abc"}],"format_version":1}',
+    "Cyborg Skin Pack": '{"header": {"description": "Cyborg Skin Pack","name": "Cyborg Skin Pack","version": [1,0,4],"uuid": "deb3b920-be8a-4b62-b8b1-5c9c7a4272f9"},"modules": [{"version": [1,0,4],"type": "skin_pack","uuid": "94d873ba-6fe7-4374-b5a4-cb36a285fd49"}],"format_version": 1}',
+    "Dress Code": '{"header": {"name": "Dress Code","version": [1,0,6],"uuid": "f47107de-385d-4e15-8a5a-cdd40a1df33d"},"modules": [{"version": [1,0,6],"type": "skin_pack","uuid": "683735a6-44f6-40e2-97b0-5039f5251353"}],"format_version": 1}',
+    "Builders & Biomes": '{"format_version":1,"header":{"name":"BuildersBiomes","uuid":"05ead86c-572c-40c8-8cb0-8733a7894185","version":[1,0,4]},"modules":[{"type":"skin_pack","uuid":"9d6e6755-42dc-4ac9-8cc8-374a4ca9a9ab","version":[1,0,4]}]}',
+    "Haipu": '{"format_version":1,"header":{"name":"Haipu","uuid":"f46a707a-36c7-45d0-becf-88c5e2f4257d","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"2791e9a8-e380-4e14-8f9c-6d3c3aa3476b","version":[1,0,3]}]}',
+    "Heartfelt": '{"header": {"name": "Heartfelt","version": [1, 0, 0],"uuid": "72fe6a92-121d-40a7-bb47-d08a41579d32"},"modules": [{"version": [1, 0, 0],"type": "skin_pack","uuid": "31a2afa5-b024-444a-822b-46d4bd1dd2c6"}],"format_version": 1}',
+    "Lunar New Year of The Ox": '{"header":{"name":"Lunar_New_Year_of_The_Ox","version":[1,0,12],"uuid":"96e8daad-3d7a-4818-bc25-2c815fb3bbc2"},"modules":[{"version":[1,0,12],"type":"skin_pack","uuid":"bed5e4b3-b108-4448-b608-0908e7905db5"}],"format_version":1}',
+    "Minecraft x Uniqlo Skins Vol 2": '{"format_version":1,"header":{"name":"pack.name","uuid":"18219eb4-d96f-4b8b-999a-6cbd1b65c58d","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"77260103-f950-4280-9a17-89da92391898","version":[1,0,5]}],"metadata":{"authors":["Mike Gaboury"]}}',
+    "Norse Mythology Bonus Skins": '{"format_version":1,"header":{"name":"pack.name","uuid":"6dd86351-0191-4a3e-85cf-2a81647b830c","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"a29a25d5-4b28-4ddb-a57d-ce272cf5fc39","version":[1,0,5]}]}',
+    "Notice Me Senpai HD": '{"header":{"name":"NoticeMeHD","version":[1,0,2],"uuid":"4bf4b0f7-dec8-4cde-b6f4-0222972d0aac"},"modules":[{"version":[1,0,2],"type":"skin_pack","uuid":"39e6f01a-da8a-4106-b66f-a643fbaee1c9"}],"format_version":1}',
+    "Onesie Skeletons": '{"header":{"name":"OnesieSkeletons","version":[1,0,3],"uuid":"87e7495b-a219-4a65-837c-654ee97ad8f6"},"modules":[{"version":[1,0,3],"type":"skin_pack","uuid":"d164c220-a005-466d-ac87-d096e08337d7"}],"format_version":1}',
+    "Popya": '{"format_version":1,"header":{"name":"Popya","uuid":"e3f6e616-ca3c-492c-bbbf-4d41b859b8cd","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"52e87833-4d00-47bb-abb1-62731227a037","version":[1,0,5]}]}',
+    "Rockin' Holiday": '{"format_version":1,"header":{"name":"RockinHoliday","uuid":"0887d1fd-a752-47d9-a119-b47e6a5fac67","version":[1,0,7]},"modules":[{"type":"skin_pack","uuid":"d8c125af-9c41-4e0c-998f-52961a0c2a0d","version":[1,0,7]}]}',
+    "Safari Adventurers": '{"header": {"name": "Safari Adventurers Skin Pack","version": [1,0,1],"uuid": "219655ca-39b4-4ec4-b04b-281a6ac1e3e5"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "3ad7c0f9-13a0-4e19-861a-04f336eec2a8"}],"format_version": 1}',
+    "Sailor Uniform": '{"format_version":1,"header":{"name":"Sailor Uniform","uuid":"00e87c90-b734-4021-88b3-7cca436747cc","version":[1,0,10]},"modules":[{"type":"skin_pack","uuid":"73b4293b-c91b-4d9b-9f12-d00d9455d2b9","version":[1,0,10]}]}',
+    "Stay Warm HD": '{"header":{"name":"StayWarmHD","version":[1,0,3],"uuid":"85a2ede9-cce0-42e4-96af-c9fd1e913b37"},"modules":[{"version":[1,0,3],"type":"skin_pack","uuid":"b0afc709-4c72-4578-953b-146f3270bcb7"}],"format_version":1}',
+    "Summer Beach Party": '{"format_version": 1,"metadata": {"authors": ["GoE-Craft","All Rights Reserved."]},"header": {"name": "SummerBeachPartySkinPack","uuid": "6fef41b8-4000-4afc-ae5d-03b08755a8e4","version": [1,0,0]},"modules": [{"type": "skin_pack","uuid": "683da9cd-a504-4001-b0bf-400991218560","version": [1,0,0]}]}',
+    "Summer Gift": '{"header":{"name":"pack.SummerGift","version":[1,0,1],"uuid":"aed5c500-83e9-44f6-9213-618a9dd32e3e"},"modules":[{"version":[1,0,1],"type":"skin_pack","uuid":"c9fe656a-9cad-48a9-97db-860e1f90021b"}],"format_version":1}',
+    "Superman": '{"format_version":1,"header":{"name":"pack.name","version":[1,0,6],"uuid":"50a5f49f-86b3-3b7e-3060-d40000f59dcb"},"modules":[{"version":[1,0,6],"type":"skin_pack","uuid":"0e837629-6794-2d56-76ef-174bb282f3ca"}]}',
+    "Timless Toys": '{"format_version":1,"header":{"name":"Timeless Toys Skins","uuid":"727df6bb-5392-4b92-b262-54545731116a","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"cbc1286c-aa81-427a-9360-0a9c4042da0a","version":[1,0,3]}]}',
+    "Vibrant Adventurers Volume 1": '{"header":{"name":"VibrantAdventurersV1","version":[1,0,1],"uuid":"5cfc95c0-7490-4bdd-a5f9-d1164decbb1b"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"d2dbc6e4-956e-4c7d-83b1-70437a168f3a"}],"format_version":1}',
+    "Vibrant Adventurers Volume 2": '{"header":{"name":"VibrantAdventurersV2","version":[1,0,3],"uuid":"b3b5a06a-7dc6-4ec6-a3cc-89c46f9a91e2"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"7e4831cb-9912-4cd3-83a0-76ffee9104d5"}],"format_version":1}',
+    "Vibrant Adventurers Volume 3": '{"header":{"name":"VibrantAdventurersV3","version":[1,0,1],"uuid":"ba692d28-b4ca-40ce-9e0e-7f7960baee13"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"96456913-21cc-4b12-99bb-a6f937c9bec1"}],"format_version":1}',
+    "Wild West Adventurers": '{"header": {"name": "Cowboys and Indians","version": [1,0,4],"uuid": "222b52e7-d292-4765-838c-66d8cbb4719d"},"modules": [{"version": [1,0,4],"type": "skin_pack","uuid": "942e9425-18c8-4246-9a90-0af9804e3d40"}],"format_version": 1}',
+    "Winter Whimsy": '{"header": {"name": "WinterWhimsy","version": [1, 0, 0],"uuid": "163b24c0-5989-4457-a68f-fbbb6099c842"},"modules": [{"version": [1, 0, 0],"type": "skin_pack","uuid": "3b8b7a48-b62a-44a7-b1ff-d93098c31cc6"}],"format_version": 1}',
+    "Young Fashion": '{"header": {"name": "Young Fashion","version": [1,0,1],"uuid": "7fdde03a-8dce-4b76-a969-6484d79358fd"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "944a69ab-c924-4155-ad7b-a4f13742fb86"}],"format_version": 1}',
+    "Young Gru": '{"header":{"name":"Young Gru","version":[1,0,8],"uuid":"670f5c25-c3a2-4a87-b48c-313b8ee35578"},"modules":[{"version":[1,0,8],"type":"skin_pack","uuid":"e84a3684-808a-42e5-8a68-610c3cb8adb8"}],"format_version":1}'
+}
+
+def generateKey(pathOrByte, isPath, variableOrFile):
+    global key, encryptedVariable
+    key = FIXED_KEY
+    cipher = Cipher(algorithms.AES(key.encode('utf-8')), modes.CFB8(key[:16].encode('utf-8')))
+    encryptor = cipher.encryptor()
+    if isPath:
+        with open(pathOrByte, 'rb') as file:
+            data = file.read()
+        with open(pathOrByte, 'wb') as file:
+            file.write(encryptor.update(data) + encryptor.finalize())
+    elif variableOrFile is True:
+        encryptedVariable = encryptor.update(pathOrByte) + encryptor.finalize()
+    else:
+        with open(variableOrFile, 'wb') as file:
+            file.write(encryptor.update(pathOrByte) + encryptor.finalize())
+
+def setup_porter(inputPath, manifestChoice):
+    global inputPathSkinpack
+    inputPathSkinpack = os.path.join(inputPath, '')
+    manifest_path = os.path.join(inputPathSkinpack, 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        f.write(MANIFEST_OPTIONS[manifestChoice])
+
+def tool_porter(inputPath):
+    global key, inputPathSkinpack, encryptedVariable
+    fileJSONContents = {"version": 1, "content": []}
+    for path, dirs, files in os.walk(inputPathSkinpack):
+        if os.path.basename(path).lower() == 'texts': continue
+        for file in files:
+            pathFile = os.path.join(path, file)
+            doEncrypt, doNotAdd = True, False
+            for pathFileSkip in fileSkipFull:
+                if pathFile.endswith(pathFileSkip):
+                    doEncrypt = False
+                    if pathFileSkip in fileSkipForce:
+                        doNotAdd = True
+                    break
+            relativePath = pathFile.replace(inputPathSkinpack, "").replace("\\", "/")
+            if doEncrypt:
+                generateKey(pathFile, True, True)
+                fileJSONContents["content"].append({'key': key, 'path': relativePath})
+            elif not doNotAdd:
+                fileJSONContents["content"].append({'path': relativePath})
+    contents_path = os.path.join(inputPathSkinpack, 'contents.json')
+    with open(contents_path, 'wb') as fileContents:
+        manifest_path = os.path.join(inputPathSkinpack, 'manifest.json')
+        with open(manifest_path, 'r') as file:
+            jsonManifest = json.load(file)
+            jsonUUID = jsonManifest['header']['uuid']
+        with open(manifest_path, 'rb') as fileManifest:
+            hashVal = b64encode(sha256(fileManifest.read()).digest()).decode()
+            fileJSONSignatures = [{"hash": hashVal, "path": "manifest.json"}]
+            sig_path = os.path.join(inputPathSkinpack, 'signatures.json')
+            generateKey(json.dumps(fileJSONSignatures, separators=(',', ':')).encode('utf-8'), False, sig_path)
+            fileJSONContents["content"].append({'key': key, 'path': 'signatures.json'})
+        headerByte = b'\xfc\xb9\xcf\x9b\x00\x00\x00\x00\x00\x00\x00\x00\x24'
+        empty = bytes(256)
+        generateKey(json.dumps(fileJSONContents, separators=(',', ':')).encode('utf-8'), False, True)
+        headerFinal = empty[:4] + headerByte + jsonUUID.encode('utf-8') + empty[53:] + encryptedVariable
+        fileContents.write(headerFinal)
+
+def import_to_minecraft_porter(temp_path, display_name=None):
+    """
+    Imports the processed pack from temp_path into the skin_packs directory.
+    Uses display_name as folder name if provided; otherwise tries to read from
+    texts/en_US.lang, falling back to the UUID.
+    """
+    manifest = None
+    for root, dirs, files in os.walk(temp_path):
+        if "manifest.json" in files:
+            manifest = Path(root) / "manifest.json"
+            break
+    if not manifest:
+        raise Exception("manifest.json not found after porter")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    uuid = data["header"]["uuid"]
+    pack_root = manifest.parent
+
+    # 1. Try to get a friendly name from the localization file
+    final_name = None
+    texts_dir = pack_root / "texts"
+    if texts_dir.exists():
+        lang_files = list(texts_dir.glob("en_US.lang")) + [f for f in texts_dir.glob("*.lang") if f.name != "en_US.lang"]
+        for lang_file in lang_files:
+            try:
+                with open(lang_file, 'r', encoding='utf-8-sig') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('skinpack.') and '=' in line:
+                            final_name = line.split('=', 1)[1].strip()
+                            break
+                        if line.startswith('persona.') and '.title=' in line:
+                            final_name = line.split('=', 1)[1].strip()
+                            break
+                if final_name:
+                    break
+            except:
+                continue
+
+    # 2. Fallback to display_name argument (original source name)
+    if not final_name and display_name:
+        final_name = display_name
+
+    # 3. Fallback to UUID
+    if not final_name:
+        final_name = uuid
+
+    # Sanitize folder name: replace characters not allowed in Windows paths
+    invalid_chars = '<>:"/\\|?*'
+    final_name = ''.join(c if c not in invalid_chars else '_' for c in final_name).strip()
+    if not final_name:
+        final_name = uuid
+
+    dest_folder = SKIN_PACK_DIR / final_name
+    # If a folder with that name already exists, append a number or use UUID? We'll keep it simple: if exists, append UUID suffix.
+    if dest_folder.exists():
+        dest_folder = SKIN_PACK_DIR / f"{final_name}_{uuid}"
+
+    if dest_folder.exists():
+        shutil.rmtree(dest_folder, ignore_errors=True)
+    dest_folder.mkdir(parents=True, exist_ok=True)
+
+    for item in pack_root.iterdir():
+        shutil.move(str(item), str(dest_folder / item.name))
+    shutil.rmtree(temp_path, ignore_errors=True)
+
+def copy_pack_first(folder):
+    temp_root = str(CACHE_DIR / "porter_temp")
+    if os.path.exists(temp_root):
+        shutil.rmtree(temp_root, ignore_errors=True)
+    os.makedirs(temp_root, exist_ok=True)
+    new_name = f"{os.path.basename(folder)}_PORTED"
+    temp_dest = os.path.join(temp_root, new_name)
+    shutil.copytree(folder, temp_dest)
+    return temp_dest
+
+# ---------- MERGER TAB ----------
 class MergerTab(QWidget):
     def __init__(self, parent, hover_sound, click_sound):
         super().__init__(parent)
@@ -1168,17 +1458,19 @@ class MergerTab(QWidget):
         self.import_merged_btn.setEnabled(False)
 
     def start_merge(self):
+        if self.merge_btn.isEnabled() == False:
+            return
         if len(self.pack_dirs) < 2:
             show_warning(self, "Not Enough Packs", "Select at least 2 packs.")
             return
-        output_dir = Path(tempfile.gettempdir()) / "merged_skinpack"
+        self.merge_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
+        output_dir = CACHE_DIR / "merged_skinpack"
         if output_dir.exists():
             shutil.rmtree(output_dir)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.log_output.clear()
-        self.merge_btn.setEnabled(False)
-        self.clear_btn.setEnabled(False)
         self.merger_worker = MergerWorker(self.pack_dirs, output_dir)
         self.merger_worker.log.connect(self.log_output.appendPlainText)
         self.merger_worker.progress.connect(self.progress_bar.setValue)
@@ -1192,7 +1484,7 @@ class MergerTab(QWidget):
         if success:
             self.log_output.appendPlainText("\nMerge finished!")
             self.import_merged_btn.setEnabled(True)
-            self.merged_pack_path = Path(tempfile.gettempdir()) / "merged_skinpack"
+            self.merged_pack_path = CACHE_DIR / "merged_skinpack"
         else:
             QMessageBox.critical(self, "Merge Error", message)
 
@@ -1220,34 +1512,40 @@ class MergerTab(QWidget):
         if not hasattr(self, 'merged_pack_path') or not self.merged_pack_path.exists():
             show_warning(self, "No pack to import", "Please merge packs first.")
             return
-        manifest_path = None
-        for root, dirs, files in os.walk(self.merged_pack_path):
-            if "manifest.json" in files:
-                manifest_path = Path(root) / "manifest.json"
-                break
-        if not manifest_path:
-            QMessageBox.critical(self, "Error", "manifest.json not found.")
+        if self.import_merged_btn.isEnabled() == False:
             return
-        with open(manifest_path) as f:
-            manifest_data = json.load(f)
-        uuid = manifest_data["header"]["uuid"]
-        if self.encrypt_checkbox.isChecked():
-            choice = self.manifest_dropdown.currentText()
-            if not self.encrypt_merged_pack(self.merged_pack_path, choice):
-                QMessageBox.critical(self, "Encryption Failed", "Unable to encrypt.")
+        self.import_merged_btn.setEnabled(False)
+        try:
+            manifest_path = None
+            for root, dirs, files in os.walk(self.merged_pack_path):
+                if "manifest.json" in files:
+                    manifest_path = Path(root) / "manifest.json"
+                    break
+            if not manifest_path:
+                QMessageBox.critical(self, "Error", "manifest.json not found.")
                 return
-        dest_name = manifest_path.parent.name
-        dest = SKIN_PACK_DIR / dest_name
-        if dest.exists():
-            reply = QMessageBox.question(self, "Overwrite", f"'{dest_name}' exists. Overwrite?", QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
-            shutil.rmtree(dest, ignore_errors=True)
-        shutil.copytree(manifest_path.parent, dest)
-        shutil.rmtree(self.merged_pack_path, ignore_errors=True)
-        self.log_output.appendPlainText(f"Imported to {dest}")
-        self.parent.scan_local()
-        self.parent.refresh_installed()
+            with open(manifest_path) as f:
+                manifest_data = json.load(f)
+            uuid = manifest_data["header"]["uuid"]
+            if self.encrypt_checkbox.isChecked():
+                choice = self.manifest_dropdown.currentText()
+                if not self.encrypt_merged_pack(self.merged_pack_path, choice):
+                    QMessageBox.critical(self, "Encryption Failed", "Unable to encrypt.")
+                    return
+            dest_name = manifest_path.parent.name
+            dest = SKIN_PACK_DIR / dest_name
+            if dest.exists():
+                reply = QMessageBox.question(self, "Overwrite", f"'{dest_name}' exists. Overwrite?", QMessageBox.Yes | QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(manifest_path.parent, dest)
+            shutil.rmtree(self.merged_pack_path, ignore_errors=True)
+            self.log_output.appendPlainText(f"Imported to {dest}")
+            self.parent.scan_local()
+            self.parent.refresh_installed()
+        finally:
+            self.import_merged_btn.setEnabled(True)
 
 # ---------------- MAIN APP ----------------
 class App(QMainWindow):
@@ -1260,6 +1558,12 @@ class App(QMainWindow):
         self.rpc = None
         self.mc_launched = False
         self.sound_enabled = settings.get("sound_enabled", True)
+        # Store pagination state
+        self.store_packs = []
+        self.filtered_packs = []
+        self.current_store_page = 1
+        self.items_per_page = STORE_ITEMS_PER_PAGE
+
         self.setWindowTitle("Melancholy")
         self.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
         self.resize(1200, 800)
@@ -1316,8 +1620,7 @@ class App(QMainWindow):
         self.sound_btn.setStyleSheet("QPushButton { background: transparent; border: 1px solid #555; border-radius: 6px; color: white; padding: 5px 10px; } QPushButton:hover { background: rgba(255,255,255,10); }")
         self.sound_btn.clicked.connect(self.toggle_sound)
         header.addWidget(self.sound_btn)
-        self.credits_btn = SoundButton("", self.hover_sound, self.click_sound)
-        self.credits_btn.setText("Credits")
+        self.credits_btn = SoundButton("Credits", self.hover_sound, self.click_sound)
         self.credits_btn.setStyleSheet("QPushButton { background: transparent; border: 1px solid #555; border-radius: 6px; color: white; padding: 5px 10px; } QPushButton:hover { background: rgba(255,255,255,10); }")
         self.credits_btn.clicked.connect(self.show_credits)
         header.addWidget(self.credits_btn)
@@ -1373,9 +1676,6 @@ class App(QMainWindow):
         self._idle = False
         self.setMouseTracking(True)
 
-    # ... (sound, RPC, Minecraft, idle, and other methods remain exactly the same as the last full version – they are unchanged)
-    # I'll include the rest unchanged for completeness.
-
     # ------------------------------------------------------------
     #  SOUND MANAGEMENT
     # ------------------------------------------------------------
@@ -1391,7 +1691,6 @@ class App(QMainWindow):
             if candidate.exists():
                 sound.setSource(QUrl.fromLocalFile(str(candidate)))
                 return sound
-        print(f"Warning: Sound file {filename} not found.")
         return None
 
     def init_sound(self):
@@ -1439,7 +1738,6 @@ class App(QMainWindow):
             ])
             self._mc_check_timer = QTimer(self)
             self._mc_check_timer.timeout.connect(self._check_mc_status)
-            self._mc_check_timer.start(5000)
             self.on_tab_changed(0)
             print("Discord Rich Presence connected")
         except Exception as e:
@@ -1512,6 +1810,8 @@ class App(QMainWindow):
                 {"label": "Download GitHub", "url": GITHUB_URL}
             ])
             self.on_tab_changed(self.tabs.currentIndex())
+            if hasattr(self, '_mc_check_timer'):
+                self._mc_check_timer.stop()
 
     def on_tab_changed(self, index):
         if self.mc_launched:
@@ -1595,13 +1895,13 @@ class App(QMainWindow):
             show_warning(self, "Game Not Found",
                          "Minecraft executable not found. Opening Microsoft Store.")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch Minecraft: {e}")
+            QMessageBox.critical(self, "Launch Error", f"Failed to launch Minecraft:\n{e}")
 
     def _set_mc_presence(self):
         self.mc_launched = True
         self._mc_ignore_checks = 2
         if hasattr(self, '_mc_check_timer'):
-            self._mc_check_timer.start(5000)
+            self._mc_check_timer.start(10000)
         self._set_mc_presence_lock(True)
         self.update_rpc_state(
             "Playing Minecraft Bedrock",
@@ -1768,14 +2068,39 @@ class App(QMainWindow):
             })
         save_state(self.state)
 
+    # ---------------- STORE BUILD (with pagination) ----------------
     def build_store(self):
         layout = QVBoxLayout(self.store_tab)
+
+        preset_layout = QHBoxLayout()
+        self.store_label = QLabel("Store:")
+        preset_layout.addWidget(self.store_label)
+        self.store_presets_combo = QComboBox()
+        self.store_presets_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.store_presets_combo.currentIndexChanged.connect(self.on_preset_changed)
+        preset_layout.addWidget(self.store_presets_combo)
+
+        self.add_store_btn = SoundButton("Add Store", self.hover_sound, self.click_sound)
+        self.add_store_btn.clicked.connect(self.add_store_preset)
+        preset_layout.addWidget(self.add_store_btn)
+
+        self.edit_store_btn = SoundButton("Edit", self.hover_sound, self.click_sound)
+        self.edit_store_btn.clicked.connect(self.edit_store_preset)
+        preset_layout.addWidget(self.edit_store_btn)
+
+        self.remove_store_btn = SoundButton("Remove", self.hover_sound, self.click_sound)
+        self.remove_store_btn.clicked.connect(self.remove_store_preset)
+        preset_layout.addWidget(self.remove_store_btn)
+        layout.addLayout(preset_layout)
+
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search store...")
         self.search_bar.textChanged.connect(self.filter_store)
         search_layout.addWidget(self.search_bar)
         layout.addLayout(search_layout)
+
+        # Scroll area for the grid
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("QScrollArea { background: transparent; }")
@@ -1785,32 +2110,183 @@ class App(QMainWindow):
         self.grid.setSpacing(12)
         self.scroll.setWidget(self.grid_host)
         layout.addWidget(self.scroll)
+
+        # Pagination controls
+        self.pagination_widget = QWidget()
+        pagination_layout = QHBoxLayout(self.pagination_widget)
+        pagination_layout.setContentsMargins(0, 5, 0, 5)
+
+        self.prev_btn = SoundButton("◀ Previous", self.hover_sound, self.click_sound)
+        self.prev_btn.clicked.connect(self.prev_store_page)
+        pagination_layout.addWidget(self.prev_btn)
+
+        self.page_label = QLabel("Page 1 of 1")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setStyleSheet("color: #ccc; font-size: 13px;")
+        pagination_layout.addWidget(self.page_label)
+
+        self.next_btn = SoundButton("Next ▶", self.hover_sound, self.click_sound)
+        self.next_btn.clicked.connect(self.next_store_page)
+        pagination_layout.addWidget(self.next_btn)
+        layout.addWidget(self.pagination_widget)
+
         self.progress = QProgressBar()
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setFixedHeight(100)
         layout.addWidget(self.progress)
         layout.addWidget(self.log)
+
         self.store_cards = []
 
+        self.refresh_presets_combo()
+
+    def refresh_presets_combo(self):
+        self.store_presets_combo.blockSignals(True)
+        self.store_presets_combo.clear()
+        presets = settings.get("store_presets", {"Official Store": MARKETPLACE_URL})
+        for name in presets.keys():
+            self.store_presets_combo.addItem(name)
+        active = settings.get("active_store_preset", "Official Store")
+        idx = self.store_presets_combo.findText(active)
+        if idx >= 0:
+            self.store_presets_combo.setCurrentIndex(idx)
+        self.store_presets_combo.blockSignals(False)
+
+    def on_preset_changed(self, index):
+        name = self.store_presets_combo.currentText()
+        if name:
+            settings["active_store_preset"] = name
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+            self.load_store()
+
+    def add_store_preset(self):
+        dialog = StorePresetDialog(self)
+        dialog.setStyleSheet(QApplication.instance().styleSheet())
+        if dialog.exec() == QDialog.Accepted:
+            name, url = dialog.get_data()
+            if not name or not url:
+                QMessageBox.warning(self, "Invalid", "Name and URL required.")
+                return
+            presets = settings.get("store_presets", {})
+            if name in presets:
+                reply = QMessageBox.question(self, "Overwrite",
+                                             f"Preset '{name}' already exists. Overwrite?")
+                if reply != QMessageBox.Yes:
+                    return
+            presets[name] = url
+            settings["store_presets"] = presets
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+            self.refresh_presets_combo()
+
+    def edit_store_preset(self):
+        current = self.store_presets_combo.currentText()
+        if not current:
+            QMessageBox.information(self, "No Selection", "Select a store preset to edit.")
+            return
+        presets = settings.get("store_presets", {})
+        if current not in presets:
+            return
+        url = presets[current]
+        dialog = StorePresetDialog(self, preset_name=current, preset_url=url)
+        dialog.setStyleSheet(QApplication.instance().styleSheet())
+        if dialog.exec() == QDialog.Accepted:
+            new_name, new_url = dialog.get_data()
+            if not new_name or not new_url:
+                return
+            del presets[current]
+            presets[new_name] = new_url
+            if settings.get("active_store_preset") == current:
+                settings["active_store_preset"] = new_name
+            settings["store_presets"] = presets
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+            self.refresh_presets_combo()
+
+    def remove_store_preset(self):
+        current = self.store_presets_combo.currentText()
+        presets = settings.get("store_presets", {})
+        if len(presets) <= 1:
+            QMessageBox.information(self, "Cannot Remove", "You must keep at least one store preset.")
+            return
+        reply = QMessageBox.question(self, "Remove Preset",
+                                     f"Remove store preset '{current}'?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            del presets[current]
+            settings["store_presets"] = presets
+            if settings.get("active_store_preset") == current:
+                first = next(iter(presets.keys()))
+                settings["active_store_preset"] = first
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+            self.refresh_presets_combo()
+            self.load_store()
+
     def filter_store(self, text):
-        for card in self.store_cards:
-            card.setVisible(text.lower() in card.pack.get("name", "").lower())
+        """Filter stored packs by search text and reset to page 1."""
+        if not hasattr(self, 'store_packs'):
+            return
+        if text.strip() == "":
+            self.filtered_packs = self.store_packs.copy()
+        else:
+            lower = text.lower()
+            self.filtered_packs = [p for p in self.store_packs if lower in p.get("name", "").lower()]
+        self.current_store_page = 1
+        self.render_store_page(self.current_store_page)
 
     def load_store(self):
-        self.store_loader = StoreLoader()
+        presets = settings.get("store_presets", {})
+        active_name = settings.get("active_store_preset", "Official Store")
+        url = presets.get(active_name, MARKETPLACE_URL)
+        self.store_loader = StoreLoader(url)
         self.store_loader.finished.connect(self.populate_store)
         self.store_loader.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self.store_loader.start()
 
     def populate_store(self, packs):
+        """Store all packs, then filter (based on current search) and show page 1."""
+        self.store_packs = packs
+        # Apply current search filter
+        search_text = self.search_bar.text().strip()
+        if search_text:
+            lower = search_text.lower()
+            self.filtered_packs = [p for p in packs if lower in p.get("name", "").lower()]
+        else:
+            self.filtered_packs = packs.copy()
+        self.current_store_page = 1
+        self.render_store_page(self.current_store_page)
+
+    def render_store_page(self, page):
+        """Render one page of the filtered store packs."""
+        # Clear existing grid
         while self.grid.count():
             w = self.grid.takeAt(0).widget()
             if w: w.deleteLater()
         self.store_cards.clear()
         StoreCard.instances.clear()
+
+        if not self.filtered_packs:
+            self.page_label.setText("No items to show")
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+            return
+
+        total_items = len(self.filtered_packs)
+        total_pages = (total_items + self.items_per_page - 1) // self.items_per_page
+
+        # Clamp page
+        page = max(1, min(page, total_pages))
+        self.current_store_page = page
+
+        start_idx = (page - 1) * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, total_items)
+        page_packs = self.filtered_packs[start_idx:end_idx]
+
         row = col = 0
-        for pack in packs:
+        for pack in page_packs:
             card = StoreCard(pack, self.state, self.start_download, self.uninstall_pack, self.hover_sound, self.click_sound)
             self.grid.addWidget(card, row, col)
             self.store_cards.append(card)
@@ -1818,8 +2294,25 @@ class App(QMainWindow):
             if col == 4:
                 col = 0
                 row += 1
-        self.filter_store(self.search_bar.text())
+
+        # Update page label
+        self.page_label.setText(f"Page {page} of {total_pages}  ·  showing {start_idx+1}–{end_idx} of {total_items}")
+
+        # Update button states
+        self.prev_btn.setEnabled(page > 1)
+        self.next_btn.setEnabled(page < total_pages)
+
+        # Apply current theme to new cards
         self.apply_theme(self.current_theme)
+
+    def prev_store_page(self):
+        if self.current_store_page > 1:
+            self.render_store_page(self.current_store_page - 1)
+
+    def next_store_page(self):
+        total_pages = (len(self.filtered_packs) + self.items_per_page - 1) // self.items_per_page
+        if self.current_store_page < total_pages:
+            self.render_store_page(self.current_store_page + 1)
 
     def start_download(self, pack):
         if self.downloading:
@@ -1842,100 +2335,6 @@ class App(QMainWindow):
         self.downloading = False
         QMessageBox.critical(self, "Download Error", err)
 
-    def install_pack(self, source: Path, pack, original_name=None, target_dir=None):
-        if target_dir is None:
-            target_dir = SKIN_PACK_DIR
-        self.log.append("Installing...")
-        try:
-            is_zip = False
-            extracted_temp = None
-            if source.is_file() and (source.suffix.lower() == '.zip' or source.suffix == ''):
-                is_zip = True
-                zip_path = source
-                if source.suffix == '':
-                    zip_path = source.with_suffix('.zip')
-                    shutil.copy2(source, zip_path)
-                try:
-                    zipfile.ZipFile(zip_path, 'r')
-                except:
-                    raise Exception("File is not a valid zip archive.")
-                temp_extract = target_dir / "__temp_install__"
-                if temp_extract.exists():
-                    shutil.rmtree(temp_extract)
-                temp_extract.mkdir()
-                with zipfile.ZipFile(zip_path, 'r') as z:
-                    z.extractall(temp_extract)
-                pack_root_candidate = temp_extract
-            elif source.is_dir():
-                pack_root_candidate = source
-            else:
-                raise Exception("Source must be a folder or a zip file (or extensionless zip).")
-
-            manifest_path = None
-            for root, dirs, files in os.walk(pack_root_candidate):
-                if "manifest.json" in files:
-                    manifest_path = Path(root) / "manifest.json"
-                    break
-            if not manifest_path:
-                raise Exception("manifest.json not found")
-
-            new_uuid, version = read_manifest(manifest_path)
-
-            existing = None
-            if target_dir == SKIN_PACK_DIR:
-                existing = next((i for i in self.state["known"] if i["uuid"] == new_uuid), None)
-            else:
-                existing = next((i for i in self.state["capes"] if i["uuid"] == new_uuid), None)
-
-            if existing:
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Existing Pack Found")
-                msg.setText(f"A pack with the same UUID already exists.\n\nInstalled: {existing['store_name']}\nUUID: {new_uuid}\n\nReplace it?")
-                msg.setStyleSheet("""
-                    QMessageBox { background-color: rgba(20,20,20,230); color: white; }
-                    QMessageBox QLabel { color: white; }
-                    QPushButton { background: rgba(255,255,255,50); border: 1px solid rgba(255,255,255,100); border-radius: 5px; color: white; padding: 5px 15px; }
-                    QPushButton:hover { background: rgba(255,255,255,100); }
-                """)
-                replace_btn = msg.addButton("Replace", QMessageBox.AcceptRole)
-                cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
-                msg.exec()
-                if msg.clickedButton() == cancel_btn:
-                    if is_zip:
-                        shutil.rmtree(pack_root_candidate, ignore_errors=True)
-                    return
-                shutil.rmtree(existing["path"], ignore_errors=True)
-                if target_dir == SKIN_PACK_DIR:
-                    self.state["known"].remove(existing)
-                else:
-                    self.state["capes"].remove(existing)
-
-            dest_name = original_name if is_zip and original_name else (source.stem if is_zip else source.name)
-            dest = target_dir / dest_name
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            shutil.copytree(manifest_path.parent, dest)
-            if is_zip:
-                shutil.rmtree(pack_root_candidate, ignore_errors=True)
-
-            display_name = get_pack_display_name(dest)
-            entry = {
-                "uuid": new_uuid, "version": version, "path": str(dest),
-                "store_name": display_name, "source": "store" if is_zip else "local"
-            }
-            if target_dir == SKIN_PACK_DIR:
-                self.state["known"].append(entry)
-            else:
-                self.state["capes"].append(entry)
-            save_state(self.state)
-            self.log.append("Installation complete.")
-            self.refresh_all()
-            self.load_store()
-        except Exception as e:
-            QMessageBox.critical(self, "Install Error", str(e))
-            if 'extracted_temp' in locals() and extracted_temp and extracted_temp.exists():
-                shutil.rmtree(extracted_temp, ignore_errors=True)
-
     # ---------------- INSTALLED TAB ----------------
     def build_installed(self):
         layout = QVBoxLayout(self.installed_tab)
@@ -1946,15 +2345,15 @@ class App(QMainWindow):
         search_layout.addWidget(self.installed_search_bar)
         layout.addLayout(search_layout)
         btn_row = QHBoxLayout()
-        refresh = SoundButton("Refresh", self.hover_sound, self.click_sound)
-        refresh.clicked.connect(self.refresh_installed)
-        btn_row.addWidget(refresh)
-        wipe = SoundButton("Safe Wipe", self.hover_sound, self.click_sound)
-        wipe.clicked.connect(self.safe_wipe)
-        btn_row.addWidget(wipe)
-        delete_btn = SoundButton("Delete", self.hover_sound, self.click_sound)
-        delete_btn.clicked.connect(self.delete_selected)
-        btn_row.addWidget(delete_btn)
+        self.installed_refresh_btn = SoundButton("Refresh", self.hover_sound, self.click_sound)
+        self.installed_refresh_btn.clicked.connect(self.refresh_installed)
+        btn_row.addWidget(self.installed_refresh_btn)
+        self.installed_wipe_btn = SoundButton("Safe Wipe", self.hover_sound, self.click_sound)
+        self.installed_wipe_btn.clicked.connect(self.safe_wipe)
+        btn_row.addWidget(self.installed_wipe_btn)
+        self.installed_delete_btn = SoundButton("Delete", self.hover_sound, self.click_sound)
+        self.installed_delete_btn.clicked.connect(self.delete_selected)
+        btn_row.addWidget(self.installed_delete_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
         self.import_drop = DragDropWidget("Drop skin pack folder or ZIP here", folder_mode=True, allow_zip=True, callback=self.handle_import_drop)
@@ -2036,15 +2435,15 @@ class App(QMainWindow):
         search_layout.addWidget(self.cape_search_bar)
         layout.addLayout(search_layout)
         btn_row = QHBoxLayout()
-        refresh = SoundButton("Refresh", self.hover_sound, self.click_sound)
-        refresh.clicked.connect(self.refresh_capes)
-        btn_row.addWidget(refresh)
-        wipe = SoundButton("Safe Wipe", self.hover_sound, self.click_sound)
-        wipe.clicked.connect(self.safe_wipe_capes)
-        btn_row.addWidget(wipe)
-        delete_btn = SoundButton("Delete", self.hover_sound, self.click_sound)
-        delete_btn.clicked.connect(self.delete_cape_selected)
-        btn_row.addWidget(delete_btn)
+        self.cape_refresh_btn = SoundButton("Refresh", self.hover_sound, self.click_sound)
+        self.cape_refresh_btn.clicked.connect(self.refresh_capes)
+        btn_row.addWidget(self.cape_refresh_btn)
+        self.cape_wipe_btn = SoundButton("Safe Wipe", self.hover_sound, self.click_sound)
+        self.cape_wipe_btn.clicked.connect(self.safe_wipe_capes)
+        btn_row.addWidget(self.cape_wipe_btn)
+        self.cape_delete_btn = SoundButton("Delete", self.hover_sound, self.click_sound)
+        self.cape_delete_btn.clicked.connect(self.delete_cape_selected)
+        btn_row.addWidget(self.cape_delete_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
         self.cape_import_drop = DragDropWidget("Drop persona pack folder or ZIP (or extensionless file) here", folder_mode=True, allow_zip=True, callback=self.handle_cape_import_drop)
@@ -2118,7 +2517,15 @@ class App(QMainWindow):
         btn = self.sender()
         if btn and btn.property("folder_path"):
             path = btn.property("folder_path")
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        else:
+            # No item selected; open the root directory depending on which button was clicked
+            if btn is self.installed_open_btn:
+                path = str(SKIN_PACK_DIR)
+            elif btn is self.cape_open_btn:
+                path = str(PERSONA_DIR)
+            else:
+                return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def refresh_all(self):
         self.refresh_installed()
@@ -2136,9 +2543,9 @@ class App(QMainWindow):
         self.porter_folder_btn = SoundButton("Select Folder", self.hover_sound, self.click_sound)
         self.porter_folder_btn.clicked.connect(self.select_porter_folder)
         layout.addWidget(self.porter_folder_btn)
-        self.manifest_dropdown = QComboBox()
-        self.manifest_dropdown.addItems(list(MANIFEST_OPTIONS.keys()))
-        layout.addWidget(self.manifest_dropdown)
+        self.porter_manifest_dropdown = QComboBox()
+        self.porter_manifest_dropdown.addItems(list(MANIFEST_OPTIONS.keys()))
+        layout.addWidget(self.porter_manifest_dropdown)
         self.porter_drop = DragDropWidget("Drop skin pack folder or ZIP here", folder_mode=True, allow_zip=True, callback=self.set_porter_folder_from_drop)
         layout.addWidget(self.porter_drop)
         self.porter_progress = QProgressBar()
@@ -2172,13 +2579,19 @@ class App(QMainWindow):
         extracted_temp = None
         try:
             original_path = Path(self.porter_folder)
+            # Determine a user-friendly name for the imported folder
+            if original_path.is_file():
+                porter_source_name = original_path.stem
+            else:
+                porter_source_name = original_path.name
+
             if original_path.is_file() and (original_path.suffix.lower() == '.zip' or original_path.suffix == ''):
                 self.porter_status.append("Extracting ZIP...")
                 zip_path = original_path
                 if original_path.suffix == '':
                     zip_path = original_path.with_suffix('.zip')
                     shutil.copy2(original_path, zip_path)
-                extracted_temp = Path(tempfile.gettempdir()) / f"porter_zip_{int(time.time())}"
+                extracted_temp = CACHE_DIR / f"porter_zip_{int(time.time())}"
                 extracted_temp.mkdir(exist_ok=True)
                 with zipfile.ZipFile(zip_path, 'r') as z:
                     z.extractall(extracted_temp)
@@ -2192,7 +2605,7 @@ class App(QMainWindow):
                 folder = str(pack_folder)
             else:
                 folder = str(original_path)
-            choice = self.manifest_dropdown.currentText()
+            choice = self.porter_manifest_dropdown.currentText()
             self.porter_status.append("Copying pack...")
             temp_copy = copy_pack_first(folder)
             self.porter_progress.setValue(25)
@@ -2205,7 +2618,12 @@ class App(QMainWindow):
             self.porter_status.append("Checking for existing packs...")
             self.remove_existing_manifest_pack(temp_copy)
             self.porter_status.append("Importing...")
-            import_to_minecraft_porter(temp_copy)
+            import_to_minecraft_porter(temp_copy, display_name=porter_source_name)
+            self.scan_local()
+            self.refresh_installed()
+            self.scan_capes()
+            self.refresh_capes()
+            self.refresh_all()
             self.porter_progress.setValue(100)
             self.porter_status.append("Done")
         except Exception as e:
@@ -2258,6 +2676,10 @@ class App(QMainWindow):
             card_name_color = "#222"
             install_btn_style = "QPushButton { background: rgba(0,0,0,15); border: 1px solid rgba(0,0,0,100); border-radius: 6px; color: #222; } QPushButton:hover { background: rgba(0,0,0,30); }"
             remove_btn_style = "QPushButton { background: rgba(0,0,0,10); border: 1px solid rgba(0,0,0,60); border-radius: 6px; color: #222; } QPushButton:hover { background: rgba(0,0,0,25); }"
+            path_label_style = f"color: {dim_color}; font-size: 11px; padding: 4px;"
+            page_label_style = f"color: {dim_color}; font-size: 13px;"
+            log_style = "QTextEdit { background: rgba(0,0,0,5); color: #222; border: 1px solid #aaa; border-radius: 6px; }"
+            plain_log_style = "QPlainTextEdit { background: rgba(0,0,0,5); color: #222; border: 1px solid #aaa; border-radius: 6px; }"
         else:
             stylesheet = DARK_STYLESHEET
             text_color = "#e0e0e0"
@@ -2270,11 +2692,14 @@ class App(QMainWindow):
             card_name_color = "#e0e0e0"
             install_btn_style = "QPushButton { background: rgba(255,255,255,40); border: 1px solid rgba(255,255,255,100); border-radius: 6px; color: white; } QPushButton:hover { background: rgba(255,255,255,100); }"
             remove_btn_style = "QPushButton { background: rgba(255,255,255,20); border: 1px solid rgba(255,255,255,80); border-radius: 6px; color: white; } QPushButton:hover { background: rgba(255,255,255,60); }"
+            path_label_style = f"color: {dim_color}; font-size: 11px; padding: 4px;"
+            page_label_style = f"color: {dim_color}; font-size: 13px;"
+            log_style = "QTextEdit { background: rgba(255,255,255,5); color: #e0e0e0; border: 1px solid #555; border-radius: 6px; }"
+            plain_log_style = "QPlainTextEdit { background: rgba(255,255,255,5); color: #e0e0e0; border: 1px solid #555; border-radius: 6px; }"
 
         app.setStyleSheet(stylesheet)
         self.background.set_theme(theme)
 
-        # Header elements
         self.app_title.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {text_color}; margin-left: 8px;")
         self.version_combo.setStyleSheet(combo_style)
         self.launch_btn.setStyleSheet(header_btn_style)
@@ -2282,11 +2707,44 @@ class App(QMainWindow):
         self.sound_btn.setStyleSheet(header_btn_style)
         self.credits_btn.setStyleSheet(header_btn_style)
 
-        # Drag‑drop widgets
+        self.store_label.setStyleSheet(f"color: {text_color};")
+        self.store_presets_combo.setStyleSheet(combo_style)
+        self.add_store_btn.setStyleSheet(header_btn_style)
+        self.edit_store_btn.setStyleSheet(header_btn_style)
+        self.remove_store_btn.setStyleSheet(header_btn_style)
+        self.search_bar.setStyleSheet("")
+
+        # Pagination buttons and label
+        self.prev_btn.setStyleSheet(header_btn_style)
+        self.next_btn.setStyleSheet(header_btn_style)
+        self.page_label.setStyleSheet(page_label_style)
+
+        self.installed_search_bar.setStyleSheet("")
+        self.installed_refresh_btn.setStyleSheet(header_btn_style)
+        self.installed_wipe_btn.setStyleSheet(header_btn_style)
+        self.installed_delete_btn.setStyleSheet(header_btn_style)
+        self.installed_path_label.setStyleSheet(path_label_style)
+        self.installed_open_btn.setStyleSheet(header_btn_style)
+
+        self.cape_search_bar.setStyleSheet("")
+        self.cape_refresh_btn.setStyleSheet(header_btn_style)
+        self.cape_wipe_btn.setStyleSheet(header_btn_style)
+        self.cape_delete_btn.setStyleSheet(header_btn_style)
+        self.cape_path_label.setStyleSheet(path_label_style)
+        self.cape_open_btn.setStyleSheet(header_btn_style)
+
+        self.porter_title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {text_color};")
+        self.porter_folder_btn.setStyleSheet(header_btn_style)
+        self.porter_manifest_dropdown.setStyleSheet(combo_style)
+        self.porter_run_btn.setStyleSheet(header_btn_style)
+
+        # Apply to log/output widgets
+        self.log.setStyleSheet(log_style)
+        self.porter_status.setStyleSheet(log_style)
+
         for dd in DragDropWidget.instances:
             dd.setStyleSheet(dd_style)
 
-        # Store cards
         for card in StoreCard.instances:
             card.setStyleSheet(f"QWidget {{ background: {card_bg}; border: 1px solid {card_border}; border-radius: 12px; }}")
             card.name_label.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {card_name_color}; border: none;")
@@ -2295,156 +2753,110 @@ class App(QMainWindow):
             if card.remove_btn:
                 card.remove_btn.setStyleSheet(remove_btn_style)
 
-        # Sub‑tabs
         if hasattr(self, 'home_tab'):
             self.home_tab.apply_theme(theme)
         if hasattr(self, 'merger_tab'):
             self.merger_tab.apply_theme(theme)
-        if hasattr(self, 'porter_title'):
-            self.porter_title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {text_color};")
+            if hasattr(self.merger_tab, 'log_output'):
+                self.merger_tab.log_output.setStyleSheet(plain_log_style)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.background.setGeometry(self.rect())
 
-# ---------------- PORTER / ENCRYPTION FUNCTIONS ----------------
-fileSkip = {'manifest.json', 'pack_icon.png'}
-fileSkipForce = {'contents.json', 'signatures.json'}
-fileSkipFull = fileSkip | fileSkipForce
-key = None
-encryptedVariable = None
-inputPathSkinpack = None
-FIXED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE'
+    # ---------------- INSTALL PACK (shared) ----------------
+    def install_pack(self, source: Path, pack, original_name=None, target_dir=None):
+        if target_dir is None:
+            target_dir = SKIN_PACK_DIR
+        self.log.append("Installing...")
+        try:
+            is_zip = False
+            extracted_temp = None
+            if source.is_file() and (source.suffix.lower() == '.zip' or source.suffix == ''):
+                is_zip = True
+                zip_path = source
+                if source.suffix == '':
+                    zip_path = source.with_suffix('.zip')
+                    shutil.copy2(source, zip_path)
+                try:
+                    zipfile.ZipFile(zip_path, 'r')
+                except:
+                    raise Exception("File is not a valid zip archive.")
+                temp_extract = target_dir / "__temp_install__"
+                if temp_extract.exists():
+                    shutil.rmtree(temp_extract)
+                temp_extract.mkdir()
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(temp_extract)
+                pack_root_candidate = temp_extract
+            elif source.is_dir():
+                pack_root_candidate = source
+            else:
+                raise Exception("Source must be a folder or a zip file (or extensionless zip).")
 
-MANIFEST_OPTIONS = {
-    "1st Birthday": '{"header":{"version":[1,0,5],"description":"pack.description","name":"pack.name","uuid":"202539ce-e6c5-40b5-a4a1-4296277d18f6"},"modules":[{"version":[1,0,5],"type":"skin_pack","uuid":"ef6f8811-933b-4673-b285-c02cf583e56d"}],"format_version":1}',
-    "1st Animal Friends": '{"format_version":1,"header":{"name":"1st Animal Friends","uuid":"9a9fa850-0b5e-11ee-9a0f-a795af90f04f","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"a162eb70-0b5e-11ee-86cb-9d9dd4413780","version":[1,0,3]}]}',
-    "Beap Borp HD": '{"header":{"name":"BeepBorpHD","version":[1,0,4],"uuid":"18215a23-e943-4004-b799-48fdcc926799"},"modules":[{"version":[1,0,4],"type":"skin_pack","uuid":"7eb2682d-9532-4db6-aa7e-b4512e347f2e"}],"format_version":1}',
-    "Blockheads": '{"header": {"name": "Blockheads","version": [1,0,0],"uuid": "8b8362a3-cd8c-4f48-9a49-b494659513b6"},"modules": [{"version": [1,0,0],"type": "skin_pack","uuid": "c47ad348-0f17-438f-ae11-6c001445a947"}],"format_version": 1}',
-    "Crafty Costumes": '{"format_version":1,"header":{"name":"CraftyCostumes","uuid":"c35ad990-3dc5-4179-bfe9-6f323d94f0b2","version":[1,0,11]},"modules":[{"type":"skin_pack","uuid":"a568d136-49ec-4287-bbe1-29110643a489","version":[1,0,11]}]}',
-    "Creepy Creatures": '{"header": {"name": "Creepy Creatures","version": [1,0,1],"uuid": "dd44b7d6-2c05-48a2-bfdf-f78596b59f44"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "f84c0b4a-7b0b-4ed3-9125-dffa2815809f"}],"format_version": 1}',
-    "Cute Kitty HD": '{"header":{"name":"CuteKittyHD","version":[1,0,10],"uuid":"7124cf9d-5d0e-4865-9656-03c1f04039c3"},"modules":[{"version":[1,0,10],"type":"skin_pack","uuid":"e9c920a2-fbb1-430a-a951-f240f48c5abc"}],"format_version":1}',
-    "Cyborg Skin Pack": '{"header": {"description": "Cyborg Skin Pack","name": "Cyborg Skin Pack","version": [1,0,4],"uuid": "deb3b920-be8a-4b62-b8b1-5c9c7a4272f9"},"modules": [{"version": [1,0,4],"type": "skin_pack","uuid": "94d873ba-6fe7-4374-b5a4-cb36a285fd49"}],"format_version": 1}',
-    "Dress Code": '{"header": {"name": "Dress Code","version": [1,0,6],"uuid": "f47107de-385d-4e15-8a5a-cdd40a1df33d"},"modules": [{"version": [1,0,6],"type": "skin_pack","uuid": "683735a6-44f6-40e2-97b0-5039f5251353"}],"format_version": 1}',
-    "Builders & Biomes": '{"format_version":1,"header":{"name":"BuildersBiomes","uuid":"05ead86c-572c-40c8-8cb0-8733a7894185","version":[1,0,4]},"modules":[{"type":"skin_pack","uuid":"9d6e6755-42dc-4ac9-8cc8-374a4ca9a9ab","version":[1,0,4]}]}',
-    "Haipu": '{"format_version":1,"header":{"name":"Haipu","uuid":"f46a707a-36c7-45d0-becf-88c5e2f4257d","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"2791e9a8-e380-4e14-8f9c-6d3c3aa3476b","version":[1,0,3]}]}',
-    "Heartfelt": '{"header": {"name": "Heartfelt","version": [1, 0, 0],"uuid": "72fe6a92-121d-40a7-bb47-d08a41579d32"},"modules": [{"version": [1, 0, 0],"type": "skin_pack","uuid": "31a2afa5-b024-444a-822b-46d4bd1dd2c6"}],"format_version": 1}',
-    "Lunar New Year of The Ox": '{"header":{"name":"Lunar_New_Year_of_The_Ox","version":[1,0,12],"uuid":"96e8daad-3d7a-4818-bc25-2c815fb3bbc2"},"modules":[{"version":[1,0,12],"type":"skin_pack","uuid":"bed5e4b3-b108-4448-b608-0908e7905db5"}],"format_version":1}',
-    "Minecraft x Uniqlo Skins Vol 2": '{"format_version":1,"header":{"name":"pack.name","uuid":"18219eb4-d96f-4b8b-999a-6cbd1b65c58d","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"77260103-f950-4280-9a17-89da92391898","version":[1,0,5]}],"metadata":{"authors":["Mike Gaboury"]}}',
-    "Norse Mythology Bonus Skins": '{"format_version":1,"header":{"name":"pack.name","uuid":"6dd86351-0191-4a3e-85cf-2a81647b830c","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"a29a25d5-4b28-4ddb-a57d-ce272cf5fc39","version":[1,0,5]}]}',
-    "Notice Me Senpai HD": '{"header":{"name":"NoticeMeHD","version":[1,0,2],"uuid":"4bf4b0f7-dec8-4cde-b6f4-0222972d0aac"},"modules":[{"version":[1,0,2],"type":"skin_pack","uuid":"39e6f01a-da8a-4106-b66f-a643fbaee1c9"}],"format_version":1}',
-    "Onesie Skeletons": '{"header":{"name":"OnesieSkeletons","version":[1,0,3],"uuid":"87e7495b-a219-4a65-837c-654ee97ad8f6"},"modules":[{"version":[1,0,3],"type":"skin_pack","uuid":"d164c220-a005-466d-ac87-d096e08337d7"}],"format_version":1}',
-    "Popya": '{"format_version":1,"header":{"name":"Popya","uuid":"e3f6e616-ca3c-492c-bbbf-4d41b859b8cd","version":[1,0,5]},"modules":[{"type":"skin_pack","uuid":"52e87833-4d00-47bb-abb1-62731227a037","version":[1,0,5]}]}',
-    "Rockin' Holiday": '{"format_version":1,"header":{"name":"RockinHoliday","uuid":"0887d1fd-a752-47d9-a119-b47e6a5fac67","version":[1,0,7]},"modules":[{"type":"skin_pack","uuid":"d8c125af-9c41-4e0c-998f-52961a0c2a0d","version":[1,0,7]}]}',
-    "Safari Adventurers": '{"header": {"name": "Safari Adventurers Skin Pack","version": [1,0,1],"uuid": "219655ca-39b4-4ec4-b04b-281a6ac1e3e5"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "3ad7c0f9-13a0-4e19-861a-04f336eec2a8"}],"format_version": 1}',
-    "Sailor Uniform": '{"format_version":1,"header":{"name":"Sailor Uniform","uuid":"00e87c90-b734-4021-88b3-7cca436747cc","version":[1,0,10]},"modules":[{"type":"skin_pack","uuid":"73b4293b-c91b-4d9b-9f12-d00d9455d2b9","version":[1,0,10]}]}',
-    "Stay Warm HD": '{"header":{"name":"StayWarmHD","version":[1,0,3],"uuid":"85a2ede9-cce0-42e4-96af-c9fd1e913b37"},"modules":[{"version":[1,0,3],"type":"skin_pack","uuid":"b0afc709-4c72-4578-953b-146f3270bcb7"}],"format_version":1}',
-    "Summer Beach Party": '{"format_version": 1,"metadata": {"authors": ["GoE-Craft","All Rights Reserved."]},"header": {"name": "SummerBeachPartySkinPack","uuid": "6fef41b8-4000-4afc-ae5d-03b08755a8e4","version": [1,0,0]},"modules": [{"type": "skin_pack","uuid": "683da9cd-a504-4001-b0bf-400991218560","version": [1,0,0]}]}',
-    "Summer Gift": '{"header":{"name":"pack.SummerGift","version":[1,0,1],"uuid":"aed5c500-83e9-44f6-9213-618a9dd32e3e"},"modules":[{"version":[1,0,1],"type":"skin_pack","uuid":"c9fe656a-9cad-48a9-97db-860e1f90021b"}],"format_version":1}',
-    "Superman": '{"format_version":1,"header":{"name":"pack.name","version":[1,0,6],"uuid":"50a5f49f-86b3-3b7e-3060-d40000f59dcb"},"modules":[{"version":[1,0,6],"type":"skin_pack","uuid":"0e837629-6794-2d56-76ef-174bb282f3ca"}]}',
-    "Timless Toys": '{"format_version":1,"header":{"name":"Timeless Toys Skins","uuid":"727df6bb-5392-4b92-b262-54545731116a","version":[1,0,3]},"modules":[{"type":"skin_pack","uuid":"cbc1286c-aa81-427a-9360-0a9c4042da0a","version":[1,0,3]}]}',
-    "Vibrant Adventurers Volume 1": '{"header":{"name":"VibrantAdventurersV1","version":[1,0,1],"uuid":"5cfc95c0-7490-4bdd-a5f9-d1164decbb1b"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"d2dbc6e4-956e-4c7d-83b1-70437a168f3a"}],"format_version":1}',
-    "Vibrant Adventurers Volume 2": '{"header":{"name":"VibrantAdventurersV2","version":[1,0,3],"uuid":"b3b5a06a-7dc6-4ec6-a3cc-89c46f9a91e2"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"7e4831cb-9912-4cd3-83a0-76ffee9104d5"}],"format_version":1}',
-    "Vibrant Adventurers Volume 3": '{"header":{"name":"VibrantAdventurersV3","version":[1,0,1],"uuid":"ba692d28-b4ca-40ce-9e0e-7f7960baee13"},"modules":[{"version":[1,0,0],"type":"skin_pack","uuid":"96456913-21cc-4b12-99bb-a6f937c9bec1"}],"format_version":1}',
-    "Wild West Adventurers": '{"header": {"name": "Cowboys and Indians","version": [1,0,4],"uuid": "222b52e7-d292-4765-838c-66d8cbb4719d"},"modules": [{"version": [1,0,4],"type": "skin_pack","uuid": "942e9425-18c8-4246-9a90-0af9804e3d40"}],"format_version": 1}',
-    "Winter Whimsy": '{"header": {"name": "WinterWhimsy","version": [1, 0, 0],"uuid": "163b24c0-5989-4457-a68f-fbbb6099c842"},"modules": [{"version": [1, 0, 0],"type": "skin_pack","uuid": "3b8b7a48-b62a-44a7-b1ff-d93098c31cc6"}],"format_version": 1}',
-    "Young Fashion": '{"header": {"name": "Young Fashion","version": [1,0,1],"uuid": "7fdde03a-8dce-4b76-a969-6484d79358fd"},"modules": [{"version": [1,0,1],"type": "skin_pack","uuid": "944a69ab-c924-4155-ad7b-a4f13742fb86"}],"format_version": 1}',
-    "Young Gru": '{"header":{"name":"Young Gru","version":[1,0,8],"uuid":"670f5c25-c3a2-4a87-b48c-313b8ee35578"},"modules":[{"version":[1,0,8],"type":"skin_pack","uuid":"e84a3684-808a-42e5-8a68-610c3cb8adb8"}],"format_version":1}'
-}
-
-def generateKey(pathOrByte, isPath, variableOrFile):
-    global key, encryptedVariable
-    key = FIXED_KEY
-    cipher = Cipher(algorithms.AES(key.encode('utf-8')), modes.CFB8(key[:16].encode('utf-8')))
-    encryptor = cipher.encryptor()
-    if isPath:
-        with open(pathOrByte, 'rb') as file:
-            data = file.read()
-        with open(pathOrByte, 'wb') as file:
-            file.write(encryptor.update(data) + encryptor.finalize())
-    elif variableOrFile is True:
-        encryptedVariable = encryptor.update(pathOrByte) + encryptor.finalize()
-    else:
-        with open(variableOrFile, 'wb') as file:
-            file.write(encryptor.update(pathOrByte) + encryptor.finalize())
-
-def setup_porter(inputPath, manifestChoice):
-    global inputPathSkinpack
-    inputPathSkinpack = os.path.join(inputPath, '')
-    manifest_path = os.path.join(inputPathSkinpack, 'manifest.json')
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        f.write(MANIFEST_OPTIONS[manifestChoice])
-
-def tool_porter(inputPath):
-    global key, inputPathSkinpack, encryptedVariable
-    fileJSONContents = {"version": 1, "content": []}
-    for path, dirs, files in os.walk(inputPathSkinpack):
-        if os.path.basename(path).lower() == 'texts': continue
-        for file in files:
-            pathFile = os.path.join(path, file)
-            doEncrypt, doNotAdd = True, False
-            for pathFileSkip in fileSkipFull:
-                if pathFile.endswith(pathFileSkip):
-                    doEncrypt = False
-                    if pathFileSkip in fileSkipForce:
-                        doNotAdd = True
+            manifest_path = None
+            for root, dirs, files in os.walk(pack_root_candidate):
+                if "manifest.json" in files:
+                    manifest_path = Path(root) / "manifest.json"
                     break
-            relativePath = pathFile.replace(inputPathSkinpack, "").replace("\\", "/")
-            if doEncrypt:
-                generateKey(pathFile, True, True)
-                fileJSONContents["content"].append({'key': key, 'path': relativePath})
-            elif not doNotAdd:
-                fileJSONContents["content"].append({'path': relativePath})
-    contents_path = os.path.join(inputPathSkinpack, 'contents.json')
-    with open(contents_path, 'wb') as fileContents:
-        manifest_path = os.path.join(inputPathSkinpack, 'manifest.json')
-        with open(manifest_path, 'r') as file:
-            jsonManifest = json.load(file)
-            jsonUUID = jsonManifest['header']['uuid']
-        with open(manifest_path, 'rb') as fileManifest:
-            hashVal = b64encode(sha256(fileManifest.read()).digest()).decode()
-            fileJSONSignatures = [{"hash": hashVal, "path": "manifest.json"}]
-            sig_path = os.path.join(inputPathSkinpack, 'signatures.json')
-            generateKey(json.dumps(fileJSONSignatures, separators=(',', ':')).encode('utf-8'), False, sig_path)
-            fileJSONContents["content"].append({'key': key, 'path': 'signatures.json'})
-        headerByte = b'\xfc\xb9\xcf\x9b\x00\x00\x00\x00\x00\x00\x00\x00\x24'
-        empty = bytes(256)
-        generateKey(json.dumps(fileJSONContents, separators=(',', ':')).encode('utf-8'), False, True)
-        headerFinal = empty[:4] + headerByte + jsonUUID.encode('utf-8') + empty[53:] + encryptedVariable
-        fileContents.write(headerFinal)
+            if not manifest_path:
+                raise Exception("manifest.json not found")
 
-def import_to_minecraft_porter(temp_path):
-    manifest = None
-    for root, dirs, files in os.walk(temp_path):
-        if "manifest.json" in files:
-            manifest = Path(root) / "manifest.json"
-            break
-    if not manifest:
-        raise Exception("manifest.json not found after porter")
-    data = json.loads(manifest.read_text(encoding="utf-8"))
-    uuid = data["header"]["uuid"]
-    dest_folder = SKIN_PACK_DIR / uuid
-    if dest_folder.exists():
-        shutil.rmtree(dest_folder, ignore_errors=True)
-    dest_folder.mkdir(parents=True, exist_ok=True)
-    pack_root = manifest.parent
-    for item in pack_root.iterdir():
-        shutil.move(str(item), str(dest_folder / item.name))
-    shutil.rmtree(temp_path, ignore_errors=True)
+            new_uuid, version = read_manifest(manifest_path)
 
-def copy_pack_first(folder):
-    temp_root = os.path.join(tempfile.gettempdir(), "porter_temp")
-    if os.path.exists(temp_root):
-        shutil.rmtree(temp_root, ignore_errors=True)
-    os.makedirs(temp_root, exist_ok=True)
-    new_name = f"{os.path.basename(folder)}_PORTED"
-    temp_dest = os.path.join(temp_root, new_name)
-    shutil.copytree(folder, temp_dest)
-    return temp_dest
+            existing = None
+            if target_dir == SKIN_PACK_DIR:
+                existing = next((i for i in self.state["known"] if i["uuid"] == new_uuid), None)
+            else:
+                existing = next((i for i in self.state["capes"] if i["uuid"] == new_uuid), None)
+
+            if existing:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Existing Pack Found")
+                msg.setText(f"A pack with the same UUID already exists.\n\nInstalled: {existing['store_name']}\nUUID: {new_uuid}\n\nReplace it?")
+                # Rely on global stylesheet for proper theming
+                replace_btn = msg.addButton("Replace", QMessageBox.AcceptRole)
+                cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+                msg.exec()
+                if msg.clickedButton() == cancel_btn:
+                    if is_zip:
+                        shutil.rmtree(pack_root_candidate, ignore_errors=True)
+                    return
+                shutil.rmtree(existing["path"], ignore_errors=True)
+                if target_dir == SKIN_PACK_DIR:
+                    self.state["known"].remove(existing)
+                else:
+                    self.state["capes"].remove(existing)
+
+            dest_name = original_name if is_zip and original_name else (source.stem if is_zip else source.name)
+            dest = target_dir / dest_name
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(manifest_path.parent, dest)
+            if is_zip:
+                shutil.rmtree(pack_root_candidate, ignore_errors=True)
+
+            display_name = get_pack_display_name(dest)
+            entry = {
+                "uuid": new_uuid, "version": version, "path": str(dest),
+                "store_name": display_name, "source": "store" if is_zip else "local"
+            }
+            if target_dir == SKIN_PACK_DIR:
+                self.state["known"].append(entry)
+            else:
+                self.state["capes"].append(entry)
+            save_state(self.state)
+            self.log.append("Installation complete.")
+            self.refresh_all()
+            self.load_store()
+        except Exception as e:
+            QMessageBox.critical(self, "Install Error", str(e))
+            if 'extracted_temp' in locals() and extracted_temp and extracted_temp.exists():
+                shutil.rmtree(extracted_temp, ignore_errors=True)
 
 # ---------------- RUN ----------------
 if __name__ == "__main__":
-    myappid = 'ecliptix.melancholy.1.1.5'
+    myappid = 'ecliptix.melancholy.1.1.6'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("assets/icon.ico")))
